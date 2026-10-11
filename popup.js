@@ -75,9 +75,16 @@ chrome.storage.sync.get(DEFAULTS, (items) => {
     setStatus('读取配置失败，请重新打开设置。自动保存已停止。', 'err');
     return;
   }
+  const config = { ...DEFAULTS, ...items };
+  if (typeof config.enabled !== 'boolean' || typeof config.dryRun !== 'boolean' ||
+      ['requiredKeywords', 'keywordWhitelist', 'exactWhitelist', 'extraRemoveLabels']
+        .some((k) => typeof config[k] !== 'string' || config[k].length > 8192)) {
+    setStatus('配置格式异常，自动保存已停止；请检查扩展存储中的设置。', 'err');
+    return;
+  }
   ready = true;
   for (const id of fieldIds) $(id).disabled = false;
-  writeForm({ ...DEFAULTS, ...items });
+  writeForm(config);
   updateHints(readForm());
   if (!$('requiredKeywords').value.trim()) setStatus('未设置必需关键词，不会移出任何人。', 'warn');
 });

@@ -509,3 +509,22 @@ test('英文 Chat with everyone 不会遮蔽 Participants', () => {
   h.document.querySelectorAll = () => [p.button, element('', [], { role: 'button', 'aria-label': 'Chat with everyone' })];
   assert.equal(h.api.peopleToggle(), p.button);
 });
+
+for (const malformed of [{ enabled: 'false' }, { dryRun: 'false' }, { exactWhitelist: {} }, { requiredKeywords: 'x'.repeat(8193) }]) {
+  test(`设置窗口拒绝异常配置而不重新保存：${Object.keys(malformed)[0]}`, () => {
+    const fields = Object.fromEntries(['status', 'size', 'enabled', 'dryRun', 'requiredKeywords', 'keywordWhitelist', 'exactWhitelist', 'extraRemoveLabels'].map((id) => [id, { value: '', addEventListener() {} }]));
+    let saved = false;
+    const context = {
+      document: { getElementById: (id) => fields[id] }, TextEncoder,
+      chrome: { runtime: {}, storage: { sync: {
+        get: (defaults, cb) => cb({ ...defaults, ...malformed }),
+        set: () => { saved = true; },
+      } } },
+    };
+    vm.runInNewContext(fs.readFileSync(path.join(__dirname, 'popup.js'), 'utf8'), context);
+    assert.equal(fields.enabled.disabled, true);
+    assert.equal(fields.dryRun.disabled, true);
+    assert.equal(saved, false);
+    assert.match(fields.status.textContent, /配置格式异常/);
+  });
+}
