@@ -31,6 +31,8 @@
     sweepInterval: 60_000,   // 人数没变时的保底全量扫描间隔（防“一进一出”漏检）
     sweepRetry: 5_000,
     panelOpenRetry: 8_000,
+    panelRender: 2_500,
+    panelBackoff: 30_000,
     menu: 2_500,
     dialog: 3_000,
     closing: 4_000,
@@ -74,8 +76,7 @@
 
   // 面板开关按钮（优先 data-panel-id，词库仅兜底）
   const PEOPLE_LABEL_RE =
-    /people|participants|everyone|协作人员|协作者|参会者|参与者|所有人|人员|成員|參與者|參加者|与会者|参加者|teilnehmer|personen|participantes|personas|personnes|partecipanti|persone|участники|deelnemers|katılımcı|uczestnicy|peserta|người tham gia|참여자|참가자|ผู้เข้าร่วม/i;
-  const CHAT_LABEL_RE = /chat|聊天|チャット|채팅/i;
+    /people|participants|everyone|协作人员|協作人員|协作者|参会者|参与者|所有人|每个人|每個人|人员|成員|參與者|參加者|与会者|與會者|参加者|teilnehmer|personen|participantes|personas|personnes|partecipanti|persone|участники|deelnemers|katılımcı|uczestnicy|peserta|người tham gia|참여자|참가자|ผู้เข้าร่วม/i;
 
   // 自己 / 展示内容（演示流）标记（匹配前已 NFKC，全角括号已变半角）
   const SELF_RE =
@@ -103,14 +104,15 @@
     recentFails: [], noRemoveStreak: 0, kicked: 0,
     pausedUntil: 0, pauseReason: '',
     lastInput: 0, lastSweepAt: 0, lastSweepCount: null, incomplete: false, retries: 0,
-    lastOpenAttempt: 0, openAttempts: [],
+    lastOpenAttempt: 0, openAttempts: [], panelRetryAt: 0,
+    panelStatus: '', cycling: false,
     coverage: null,
     listObserver: null, observedList: null,
     tickTimer: 0, harvestTimer: 0,
   };
 
   const DEFAULTS = {
-    enabled: true, dryRun: true,
+    enabled: true, dryRun: false,
     requiredKeywords: 'AA', keywordWhitelist: '', exactWhitelist: '', extraRemoveLabels: '',
   };
   let configReady = false, configRevision = 0, configRequest = 0;
@@ -144,6 +146,7 @@
     // 规则变更 → 旧判定与退避全部作废
     state.suspects.clear(); state.hold.clear(); state.fails.clear();
     state.noRemoveStreak = 0; state.pausedUntil = 0;
+    state.lastOpenAttempt = 0; state.openAttempts = []; state.panelRetryAt = 0;
     configRevision++;
     configReady = true;
   }
@@ -307,29 +310,44 @@
   const isButtonLike = (el) => el.matches('button, [role="button"]');
 
   function peopleToggle() {
-    return (
-      document.querySelector('button[data-panel-id="1"], [role="button"][data-panel-id="1"]') ||
-      [...document.querySelectorAll('button, [role="button"]')].find((b) => PEOPLE_LABEL_RE.test(b.getAttribute('aria-label') || ''))
-    );
-  }
-  function chatToggle() {
-    return (
-      document.querySelector('button[data-panel-id="2"], [role="button"][data-panel-id="2"]') ||
-      [...document.querySelectorAll('button, [role="button"]')].find((b) => CHAT_LABEL_RE.test(b.getAttribute('aria-label') || ''))
-    );
+    const buttons = [...document.querySelectorAll('button, [role="button"]')].filter((b) =>
+      isVisible(b) && !b.matches(':disabled, [aria-disabled="true"]') &&
+      !b.closest('[role="listitem"], [role="menu"], [role="dialog"], [role="alertdialog"]'));
+    const unique = (items) => items.length === 1 ? items[0] : null;
+    const labels = new Map(buttons.map((b) => {
+      const labelledBy = (b.getAttribute('aria-labelledby') || '').split(/\s+/)
+        .map((id) => document.getElementById(id)?.textContent || '').join(' ');
+      return [b, [
+        b.getAttribute('aria-label'), b.getAttribute('title'),
+        b.getAttribute('data-tooltip'), b.getAttribute('data-tooltip-text'), labelledBy,
+      ].filter(Boolean).join(' ')];
+    }));
+    // 实测新布局同时有“参与者”和“与所有人聊天”，不能把聊天当成第二个参与者按钮。
+    const candidates = buttons.filter((b) =>
+      !/\b(chat|messages?|messaging)\b|聊天|消息|訊息|チャット|メッセージ|채팅|메시지/i.test(labels.get(b)));
+    const exact = candidates.filter((b) =>
+      /^(参与者|參與者|参会者|參會者|协作人员|協作人員|people|participants|everyone)(?:\s*[（(]?\d+[）)]?)?$/i.test(norm(labels.get(b))));
+    if (exact.length) return unique(exact);
+    const byPanel = candidates.filter((b) => b.getAttribute('data-panel-id') === '1');
+    if (byPanel.length) return unique(byPanel);
+    const byLabel = candidates.filter((b) => PEOPLE_LABEL_RE.test(labels.get(b)));
+    if (byLabel.length) return unique(byLabel);
+    // 新布局可能只有群组图标和人数；只认实际图标元素，不按坐标或人数猜按钮。
+    return unique(candidates.filter((b) => iconNames(b).some((name) =>
+      ['people', 'group', 'groups', 'supervisor_account'].includes(name))));
   }
   const isPressed = (b) => !!b && (b.getAttribute('aria-pressed') === 'true' || b.getAttribute('aria-expanded') === 'true');
 
   /** 参与者行：先找“人员面板根”下的 listitem；找不到再全局兜底（排除聊天/对话框/菜单）。 */
   function findRowsRaw() {
     const roots = [...document.querySelectorAll('[data-panel-id="1"]')].filter((el) => !isButtonLike(el));
-    let rows = roots.flatMap((r) => [...r.querySelectorAll('[role="listitem"]')]);
+    let rows = roots.flatMap((r) => [...r.querySelectorAll('[role="listitem"]')]).filter(isVisible);
     if (!rows.length) {
       rows = [...document.querySelectorAll('[role="list"] [role="listitem"]')].filter(
-        (el) => !el.closest('[data-panel-id="2"], [role="dialog"], [role="menu"]')
+        (el) => !el.closest('[data-panel-id="2"], [role="dialog"], [role="alertdialog"], [role="menu"]')
       );
     }
-    return rows;
+    return [...new Set(rows)].filter(isVisible);
   }
 
   /** 最近的可滚动祖先（不再假设 list.parentElement 就是滚动容器）。 */
@@ -435,30 +453,66 @@
     return { ok: false, why: 'violation' };
   }
 
-  /* ════════════════════════ 7. 面板维护（不抢焦点、不反复开关） ════════════════════════ */
+  /* ════════════════════════ 7. 面板维护（运行时自动打开参与者面板） ════════════════════════ */
   const userIsTyping = () => {
     const a = document.activeElement;
-    return !!a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable);
+    const editable = !!a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable);
+    // 输入框保有焦点不代表仍在输入；停止真实操作3秒后允许切换。
+    return editable && Date.now() - state.lastInput < T.idleBeforeSweep;
   };
 
-  function ensurePeoplePanel() {
-    if (findRowsRaw().length) return true;
-    if (userIsTyping()) return false;           // 正在输入 → 不打断
-    if (isPressed(chatToggle())) return false;  // 聊天面板开着 → 不抢占
+  function panelReady() {
+    if (!findRowsRaw().length) return false;
+    state.lastOpenAttempt = 0;
+    state.openAttempts = [];
+    state.panelRetryAt = 0;
+    state.panelStatus = '';
+    return true;
+  }
+
+  async function ensurePeoplePanel() {
+    if (panelReady()) return true; // 手动打开后立即恢复，不受面板重试退避影响。
+    state.panelStatus = '正在准备参与者面板';
+    if (!alive() || !configReady || !cfg.enabled || !cfg.required.length) return false;
+    if (document.hidden) { state.panelStatus = '后台待命 · 返回页面后自动恢复'; return false; }
+    if (userIsTyping() || Date.now() - state.lastInput < T.userBusy) {
+      state.panelStatus = '等待当前输入结束后打开参与者面板';
+      return false;
+    }
+    if (queryMenus().length || queryDialogs().length) {
+      state.panelStatus = '等待当前菜单或对话框关闭';
+      return false;
+    }
     const btn = peopleToggle();
-    if (!btn || isPressed(btn)) return false;   // 面板已开但还没渲染 → 等，别把它点关了
+    if (!btn) { state.panelStatus = '未识别到唯一的参与者按钮 · 持续重试'; return false; }
+    // 已展开时只等待列表，不能再次点击把面板关掉。
+    if (isPressed(btn)) { state.panelStatus = '参与者面板已展开 · 等待可见名单'; return false; }
 
     const now = Date.now();
     state.openAttempts = state.openAttempts.filter((t) => now - t < 60_000);
-    if (now - state.lastOpenAttempt < T.panelOpenRetry) return false;
-    if (state.openAttempts.length >= 3) { // 点了 3 次仍识别不到列表 → 多半是 DOM 改版，停手并告警
-      pause(5 * 60_000, '识别不到参与者列表（Meet 界面可能已更新）');
-      state.openAttempts = [];
+    if (now < state.panelRetryAt || (state.lastOpenAttempt && now - state.lastOpenAttempt < T.panelOpenRetry)) {
+      state.panelStatus = '参与者面板尚未就绪 · 等待重试';
       return false;
     }
+    if (state.openAttempts.length >= 3) {
+      // 面板失败只退避打开动作，不进入移出操作的全局安全熔断。
+      state.panelRetryAt = now + T.panelBackoff;
+      state.openAttempts = [];
+      state.panelStatus = '参与者面板打开失败 · 30秒后重试（手动打开可立即恢复）';
+      return false;
+    }
+    const revision = configRevision, inputAt = state.lastInput;
     state.lastOpenAttempt = now;
     state.openAttempts.push(now);
-    press(btn);
+    state.panelStatus = '正在打开参与者面板';
+    btn.click(); // 聊天/其他面板打开也切换；不额外抢输入焦点。
+    await waitFor(() => {
+      if (!alive() || revision !== configRevision || !configReady || !cfg.enabled || state.lastInput !== inputAt) return 'aborted';
+      return findRowsRaw().length ? 'ready' : null;
+    }, { timeout: T.panelRender });
+    if (!alive() || revision !== configRevision || !configReady || !cfg.enabled || state.lastInput !== inputAt) return false;
+    if (panelReady()) return true;
+    state.panelStatus = '等待参与者名单渲染 · 自动重试';
     return false;
   }
 
@@ -470,9 +524,14 @@
   function attachListObserver() {
     const first = findRowsRaw()[0];
     const list = first && (first.closest('[role="list"]') || first.parentElement);
-    if (!list || state.observedList === list) return;
+    if (state.observedList === (list || null)) return;
     state.listObserver?.disconnect();
-    state.observedList = list;
+    state.listObserver = null;
+    state.observedList = list || null;
+    state.coverage = null; state.lastSweepAt = 0; state.lastSweepCount = null;
+    state.incomplete = false; state.retries = 0;
+    state.suspects.clear();
+    if (!list) return;
     state.listObserver = new MutationObserver(() => { if (!state.busy && !state.sweeping) scheduleHarvest(); });
     state.listObserver.observe(list, {
       childList: true, subtree: true, characterData: true,
@@ -791,13 +850,15 @@
   /* ════════════════════════ 11. 调度 ════════════════════════ */
   async function runCycle() {
     pruneState();
-    if (state.busy) return; // 处置进行中：本周期让路，HUD 保持“处理中”
+    if (state.busy || state.sweeping) return; // 处置/扫描进行中，不开启并发周期。
     if (!configReady) return hud.set('配置未就绪 · 自动操作已停止', C.warn);
     if (!cfg.enabled) return hud.set('已暂停', C.warn);
-    if (!peopleToggle()) return hud.set('待命（未入会）', C.idle);
     if (!cfg.required.length) return hud.set('未设置必需关键词 · 不执行移出', C.warn);
     if (Date.now() < state.pausedUntil) return hud.set(`已暂停：${state.pauseReason}`, C.err);
-    if (!ensurePeoplePanel()) return hud.set('参与者面板未打开 · 巡检暂缓', C.idle);
+    if (!(await ensurePeoplePanel())) {
+      attachListObserver(); // 清理已卸载列表，重新打开时绑定新的列表。
+      return hud.set(state.panelStatus || '参与者名单未就绪 · 持续重试', C.idle);
+    }
 
     attachListObserver();
     const target = harvest();
@@ -811,9 +872,12 @@
   }
 
   async function tick() {
+    if (state.cycling) return;
     if (!alive()) return shutdown('扩展上下文失效（扩展被重载/卸载）');
+    state.cycling = true;
     try { await runCycle(); }
     catch (err) { console.error(LOG, '巡检周期异常（已隔离，下个周期继续）：', err); }
+    finally { state.cycling = false; }
     if (alive()) state.tickTimer = setTimeout(tick, document.hidden ? T.tick * 3 : T.tick);
     else shutdown('扩展上下文失效');
   }
@@ -835,9 +899,15 @@
 
     // 只认真人输入（isTrusted），我们自己派发的合成事件不算
     const markInput = (e) => { if (e.isTrusted) state.lastInput = Date.now(); };
-    for (const type of ['wheel', 'pointerdown', 'keydown', 'touchstart']) {
+    for (const type of ['wheel', 'pointerdown', 'keydown', 'touchstart', 'input', 'paste', 'compositionstart', 'compositionupdate', 'compositionend']) {
       document.addEventListener(type, markInput, { capture: true, passive: true, signal: life.signal });
     }
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && !state.cycling && alive()) {
+        clearTimeout(state.tickTimer);
+        state.tickTimer = setTimeout(tick, 0);
+      }
+    }, { signal: life.signal });
 
     tick();
     console.info(LOG, '巡检引擎已挂载 v1.0.0');

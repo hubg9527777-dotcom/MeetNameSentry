@@ -1,7 +1,7 @@
 // popup.js — 与 content.js 共用同一套 storage 字段与默认值
 const DEFAULTS = {
   enabled: true,
-  dryRun: true,
+  dryRun: false,
   requiredKeywords: 'AA',
   keywordWhitelist: '',
   exactWhitelist: '',
