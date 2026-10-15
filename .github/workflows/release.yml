@@ -47,7 +47,6 @@ jobs:
             content.js \
             popup.js \
             popup.html \
-            popup.css \
             icons/*
 
           unzip -t "dist/MeetNameSentry-${TAG}.zip"
