@@ -1,0 +1,67 @@
+name: Build and Publish Chrome Extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag, for example v1.0.1'
+        required: true
+        default: 'v1.0.1'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Verify manifest version
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          test -f manifest.json
+          VERSION=$(node -p "JSON.parse(require('fs').readFileSync('manifest.json', 'utf8')).version")
+          test "v$VERSION" = "$TAG" || {
+            echo "Version mismatch: manifest=$VERSION tag=$TAG"
+            exit 1
+          }
+          node --check content.js
+          node --check popup.js
+
+      - name: Package extension
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          mkdir -p dist
+          zip -q -X "dist/MeetNameSentry-${TAG}.zip" \
+            manifest.json \
+            content.js \
+            popup.js \
+            popup.html \
+            popup.css \
+            icons/*
+
+          unzip -t "dist/MeetNameSentry-${TAG}.zip"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip --clobber
+          else
+            gh release create "$TAG" dist/*.zip \
+              --title "MeetNameSentry $TAG" \
+              --generate-notes
+          fi
