@@ -47,24 +47,54 @@ function updateHints(payload) {
 
 let ready = false;
 let timer = 0;
-function scheduleSave() {
-  if (!ready) return;
-  clearTimeout(timer);
-  setStatus('保存中…');
-  timer = setTimeout(save, 350); // 防抖：输入时不频繁写 sync（sync 有写入频率配额）
-}
+const pendingText = new Set();
+let writeGeneration = 0;
+const failedFields = new Set();
+const textFieldIds = ['requiredKeywords', 'keywordWhitelist', 'exactWhitelist', 'extraRemoveLabels'];
 
-function save() {
-  if (!ready) return;
-  const payload = readForm();
-  updateHints(payload);
+// 按字段写入：旧的文本保存不能携带旧 dryRun/enabled，覆盖最新安全开关。
+// Chrome storage 是异步的，回调也可能乱序；只有最后一个回调能更新状态提示。
+function persist(fields) {
+  if (!ready || !fields.length) return;
+  const form = readForm();
+  const payload = Object.fromEntries(fields.map((id) => [id, form[id]]));
+  updateHints(form);
+  // sync.set 单条记录存在 8KiB 配额，提前拒绝，避免误显示已保存。
+  const oversized = fields.find((id) => typeof form[id] === 'string' &&
+    byteLen(id) + byteLen(JSON.stringify(form[id])) > ITEM_LIMIT);
+  if (oversized) {
+    failedFields.add(oversized);
+    return setStatus(`保存失败：${oversized} 超过同步存储单项大小限制`, 'err');
+  }
+  const generation = ++writeGeneration;
+  setStatus('保存中…');
   chrome.storage.sync.set(payload, () => {
     const err = chrome.runtime.lastError;
-    if (err) return setStatus(`保存失败：${err.message}`, 'err');
-    if (!payload.requiredKeywords.trim()) return setStatus('已保存。未设置必需关键词，不会移出任何人。', 'warn');
-    if (payload.dryRun) return setStatus('已保存。试运行中，不会真正移出。', 'warn');
+    if (err) fields.forEach((id) => failedFields.add(id));
+    else fields.forEach((id) => failedFields.delete(id));
+    if (failedFields.size) return setStatus('保存失败：部分设置未写入，请重新操作并确认。', 'err');
+    if (generation !== writeGeneration) return;
+    if (!form.requiredKeywords.trim()) return setStatus('已保存。未设置必需关键词，不会移出任何人。', 'warn');
+    if (form.dryRun) return setStatus('已保存。试运行中，不会真正移出。', 'warn');
     setStatus('已保存', 'ok');
   });
+}
+
+function flushText() {
+  if (!pendingText.size) return;
+  clearTimeout(timer);
+  timer = 0;
+  const fields = [...pendingText];
+  pendingText.clear();
+  persist(fields);
+}
+
+function scheduleSave(id) {
+  if (!ready) return;
+  pendingText.add(id);
+  clearTimeout(timer);
+  setStatus('保存中…');
+  timer = setTimeout(flushText, 350);
 }
 
 const fieldIds = Object.keys(DEFAULTS);
@@ -89,7 +119,16 @@ chrome.storage.sync.get(DEFAULTS, (items) => {
   if (!$('requiredKeywords').value.trim()) setStatus('未设置必需关键词，不会移出任何人。', 'warn');
 });
 
-for (const id of ['enabled', 'dryRun']) $(id).addEventListener('change', scheduleSave);
-for (const id of ['requiredKeywords', 'keywordWhitelist', 'exactWhitelist', 'extraRemoveLabels']) {
-  $(id).addEventListener('input', scheduleSave);
+// 安全开关当场发出单字段写入，不受文字输入防抖影响。
+for (const id of ['enabled', 'dryRun']) $(id).addEventListener('change', () => {
+  if (!ready) return;
+  flushText();
+  persist([id]);
+});
+// 文字字段分别追踪待保存项，不会因编辑另一个文本字段丢失先前修改。
+for (const id of textFieldIds) {
+  $(id).addEventListener('input', () => scheduleSave(id));
+  $(id).addEventListener('change', flushText);
 }
+// 页面关闭时尽力发出最后一次写入；异步完成与跨设备同步仍无法在关闭后保证。
+if (typeof window !== 'undefined') window.addEventListener('pagehide', flushText);

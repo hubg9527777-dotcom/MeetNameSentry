@@ -1,5 +1,5 @@
 /**
- * MeetNameSentry — content.js (v1.0.0)
+ * MeetNameSentry — content.js (v1.0.1)
  * Google Meet 命名纪律守卫（只有主持人 / 联席主持人才真正有“移出”权限）
  *
  * 设计原则
@@ -67,6 +67,14 @@
   // 这些菜单项绝不能点（尤其“举报”）
   const MENU_NEGATIVE_RE =
     /\b(report|block|pin|unpin|mute|hide|spotlight|melden|signaler|denunciar|bloquear)\b|举报|檢舉|举報|舉報|報告|报告|通報|신고|屏蔽|封鎖|固定|不显示|不顯示|隐藏|隱藏|静音|靜音|聚焦/;
+  // 明确排除批量处置菜单项；本扩展只允许逐个定位、逐个移出参会者。
+  // 语言词库不是完整的 Meet 国际化清单；识别到可疑批量文案就停止，绝不猜。
+  // 英 / 西 / 葡 / 法 / 意 / 德等常见界面：动作与“所有人”可前置或后置。
+  const BULK_ACTION_RE = /\b(?:remove|kick|expel|exclude|delete|quitar|eliminar|expulsar|sacar|remover|excluir|supprimer|retirer|exclure|rimuovi|rimuovere|elimina|espelli|entfernen|ausschlie(?:ßen|ssen))\b/u;
+  const BULK_SCOPE_RE = /\b(?:all|everyone|everybody|entire|participants|members|todos|todas|tutti|tutte|tous|toutes|alle|allen|sämtliche|tout le monde|todo el mundo|todo mundo)\b/u;
+  const BULK_REMOVE_RE = /移出所有|移除所有|踢出所有|删除所有|刪除所有|全部移出|全员移出|全員移出|全员.*(?:移出|移除)|全員.*(?:削除|退出)|(?:削除|退出).*全員|모든.*(?:내보내|제거)|(?:내보내|제거).*모든/u;
+  const isBulkRemoval = (text) => BULK_REMOVE_RE.test(text) ||
+    (BULK_ACTION_RE.test(text) && BULK_SCOPE_RE.test(text));
 
   // 确认对话框按钮
   const DESTRUCTIVE_RE =
@@ -79,13 +87,11 @@
     /people|participants|everyone|协作人员|協作人員|协作者|参会者|参与者|所有人|每个人|每個人|人员|成員|參與者|參加者|与会者|與會者|参加者|teilnehmer|personen|participantes|personas|personnes|partecipanti|persone|участники|deelnemers|katılımcı|uczestnicy|peserta|người tham gia|참여자|참가자|ผู้เข้าร่วม/i;
 
   // 自己 / 展示内容（演示流）标记（匹配前已 NFKC，全角括号已变半角）
-  const SELF_RE =
-    /\(\s*(you|你|您|あなた|du|tú|tu|vous|você|voce|ты|вы|당신|나|jij|sen|ty|anda|bạn)\s*\)/;
   const PRESENTATION_RE =
     /\([^()]*(presentation|presenting|presentación|presentacion|apresenta|präsentation|présentation|presentazione|презентац|展示内容|展示內容|演示内容|プレゼン|발표|프레젠)[^()]*\)/;
   // 主持人徽标：只在“昵称之外”的次级文本里匹配，避免被昵称伪造
   const HOST_RE =
-    /host|organi[sz]er|moderator|主持|主办|主辦|ホスト|호스트|gastgeber|anfitri|hôte|organisateur|organizzatore|organizador|организатор|ведущий|ev sahibi|gospodarz|tuan rumah|chủ trì|người tổ chức/;
+    /\b(?:co[-\s]?)?host\b|\borgani[sz]er\b|\bmoderator\b|主持|主办|主辦|ホスト|호스트|gastgeber|anfitri|hôte|organisateur|organizzatore|organizador|организатор|ведущий|ev sahibi|gospodarz|tuan rumah|chủ trì|người tổ chức/;
 
   // Material Icons / Google Symbols 连字：形态 + 字体双重判定，不再用“保留词黑名单”
   // （黑名单会让昵称叫 mic / pin / info 的人直接免疫）
@@ -118,16 +124,55 @@
   let configReady = false, configRevision = 0, configRequest = 0;
   const cfg = { enabled: false, dryRun: false, required: [], keywords: [], exact: new Set(), extraRemove: [] };
 
-  // NFKC：全角“ＡＡ”→“aa”；去零宽字符；折叠空白；转小写
+  // NFKC：全角ＡＡ→aa；删除所有 Unicode 默认不可见字符（不仅限常见零宽字符）。
+  // 否则 AA\u2063lice 在视觉上是 AAlice，却会被看成 AA + "非拉丁边界" 而错误放行。
   const norm = (s) =>
     String(s ?? '')
       .normalize('NFKC')
-      .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, '')
+      .replace(/\p{Default_Ignorable_Code_Point}/gu, '')
       .replace(/\s+/g, ' ')
       .trim()
       .toLowerCase();
 
   const splitList = (s, sep) => String(s ?? '').split(sep).map(norm).filter(Boolean);
+
+  const LATIN_TOKEN_CHAR_RE = /[\p{Script=Latin}\p{Number}\p{Mark}]/u;
+  const LETTER_RE = /\p{Letter}/u;
+  const LETTER_OR_NUMBER_RE = /[\p{Letter}\p{Number}]/u;
+  const isLatinLikeMarker = (marker) => LATIN_TOKEN_CHAR_RE.test(firstCodePoint(marker)) ||
+    LATIN_TOKEN_CHAR_RE.test(lastCodePoint(marker));
+  // 返回完整的 Unicode 码点而不是 UTF-16 单个码元；避免补充平面字符破坏边界判断。
+  const lastCodePoint = (s) => Array.from(s).at(-1) || '';
+  const firstCodePoint = (s) => Array.from(s)[0] || '';
+
+  /**
+   * 英文标记不可嵌在更长的拉丁字母/数字中。
+   * strictEdge=true：必需关键词只能位于姓名前缀或后缀，且除标记外必须确实有姓名文字：
+   *   AA张三、张三AA、[AA]张三、张三(AA) → 合规；张AA三、AA、AA--- → 不合规。
+   * 关键词白名单保留已有“词内独立标记”的用法，不强制前后缀。
+   */
+  function containsCompleteMarker(name, marker, strictEdge = false) {
+    if (!name || !marker) return false;
+    const checkLeft = LATIN_TOKEN_CHAR_RE.test(firstCodePoint(marker));
+    const checkRight = LATIN_TOKEN_CHAR_RE.test(lastCodePoint(marker));
+    let from = 0;
+    while (from <= name.length - marker.length) {
+      const pos = name.indexOf(marker, from);
+      if (pos < 0) return false;
+      const left = name.slice(0, pos);
+      const right = name.slice(pos + marker.length);
+      const before = lastCodePoint(left);
+      const after = firstCodePoint(right);
+      const tokenOk = (!checkLeft || !before || !LATIN_TOKEN_CHAR_RE.test(before)) &&
+        (!checkRight || !after || !LATIN_TOKEN_CHAR_RE.test(after));
+      const edgeOk = !strictEdge ||
+        (!LETTER_OR_NUMBER_RE.test(left) && LETTER_RE.test(right)) ||
+        (!LETTER_OR_NUMBER_RE.test(right) && LETTER_RE.test(left));
+      if (tokenOk && edgeOk) return true;
+      from = pos + 1;
+    }
+    return false;
+  }
 
   function applyConfig(items) {
     const it = { ...DEFAULTS, ...(items || {}) };
@@ -374,7 +419,7 @@
       const t = n.nodeValue.replace(/\s+/g, ' ').trim();
       if (!t) continue;
       const el = n.parentElement;
-      if (!el || insideWithin(el, row, 'button, [role="button"], [aria-hidden="true"]')) continue;
+      if (!el || !isVisible(el) || insideWithin(el, row, 'button, [role="button"], [aria-hidden="true"]')) continue;
       // 只有“长得像连字”的文本才去查字体，兼顾性能；昵称就算叫 mic 也不会被误杀
       if (LIGATURE_RE.test(t) && isIconElement(el)) continue;
       if (!out.includes(t)) out.push(t);
@@ -394,33 +439,67 @@
 
   /** “更多操作”按钮：仅认菜单属性或明确的更多图标，不猜行内最后一个按钮。 */
   function findMoreButton(row) {
-    const btns = [...row.querySelectorAll('button, [role="button"]')];
-    return (
-      btns.find((b) => /^(menu|true)$/.test(b.getAttribute('aria-haspopup') || '')) ||
-      btns.find((b) => /more_vert|more_horiz/.test(b.textContent || '')) ||
-      null
-    );
+    const btns = [...row.querySelectorAll('button, [role="button"]')]
+      .filter((b) => isVisible(b) && !b.matches(':disabled, [aria-disabled="true"]'));
+    // “更多操作”入口不唯一时拒绝猜测目标，防止界面改版后点错参会者。
+    const explicit = btns.filter((b) => /^(menu|true)$/.test(b.getAttribute('aria-haspopup') || ''));
+    if (explicit.length > 1) return null;
+    if (explicit.length === 1) return explicit[0];
+    const byIcon = btns.filter((b) => /^(more_vert|more_horiz)$/.test(norm(b.textContent)));
+    return byIcon.length === 1 ? byIcon[0] : null;
   }
 
   /** 解析一行 → 结构化信息（不缓存 DOM 引用到长期状态里）。 */
   function readRow(row, selfId) {
     const texts = collectTexts(row);
     const label = (row.getAttribute('aria-label') || '').trim();
-    const name = label || texts[0] || '';
+    // 用户可见姓名优先于 aria-label（无障碍标签可能附带状态/操作提示，不能把提示里的 AA 当成姓名）。
+    // 如果两种来源完全对不上，则姓名来源有歧义，宁可跳过该行，不触发破坏性操作。
+    let visibleName = texts[0] || '';
+    let nameTextIndex = 0;
+    // 某些名单行先渲染头像缩写（A/AJ/张），再渲染真正昵称。
+    // 在这种情况下不能把头像缩写当作姓名，否则可能误移出 AA张三。
+    // 仅当 aria-label 以第二段真实文本开头时认领第二段，否则标记歧义并跳过。
+    const first = norm(visibleName);
+    const second = norm(texts[1] || '');
+    const labelN = norm(label);
+    if (first && second && Array.from(first).length <= 2 && second.length > first.length &&
+        (labelN.startsWith(second) || (labelN.includes(second) && second.startsWith(first)))) {
+      if (!labelN.startsWith(second)) return null;
+      visibleName = texts[1];
+      nameTextIndex = 1;
+    }
+    // 只有头像缩写而完整名字只存在于辅助标签时，无法确认两者关系：跳过而非移出。
+    // 例：仅可见 A，aria-label=AA张三, 已静音，不能把 A 当作姓名判违规。
+    if (texts.length === 1 && first && Array.from(first).length <= 2 && labelN &&
+        labelN.split(/[,，;；]/, 1)[0].trim() !== first) return null;
+    // 无真实可见姓名时，aria-label 可能只是状态/按钮提示；不把它当作移出依据。
+    if (!visibleName) return null;
+    // 头像在前却缺少可核对的辅助标签，无法区分头像与姓名，安全跳过。
+    if (nameTextIndex === 0 && first && Array.from(first).length <= 2 &&
+        texts.length > 1 && second && second.length > first.length && !labelN) return null;
+    if (label && !labelN.includes(norm(visibleName))) return null;
+    const name = visibleName;
     const nameN = norm(name);
     if (!nameN) return null; // 读不出名字 → 不参与判定
 
+    // 该值只辅助当前会议 DOM 目标定位，不是 Google 账号身份或合规准入要求；
+    // 无痕/访客参会者没有此属性时，按当前显示姓名创建临时候选键。
     const id =
       row.getAttribute('data-participant-id') ||
       row.querySelector('[data-participant-id]')?.getAttribute('data-participant-id') ||
       '';
-    const everything = norm([label, ...texts].join(' '));
     // 自己：有可靠 id 就只认 id（文本标记可被昵称伪造）；否则退化为文本标记
-    const isSelf = selfId && id ? id === selfId : SELF_RE.test(everything);
+    // 禁止用“昵称写 (You)”伪装自己；仅在 Meet 提供的参与者 ID 明确一致时豁免。
+    const isSelf = Boolean(selfId && id && id === selfId);
+    // 注意头像缩写可以排在昵称前：此时 texts[1] 才是姓名，不能把它也当成主持人/演示标签。
+    // 仅从完整昵称之后的独立文本里读取辅助身份标记。
+    const badges = texts.slice(nameTextIndex + 1);
     return {
       row, key: id || `n:${nameN}`, name, nameN, isSelf,
-      isHost: texts.slice(1).some((t) => HOST_RE.test(norm(t))), // 只看昵称之外的文本
-      isPresentation: PRESENTATION_RE.test(everything),
+      isHost: badges.some((t) => HOST_RE.test(norm(t))),
+      // 昵称“foo (presentation)”本身不能获得演示流豁免；只认独立的次级描述。
+      isPresentation: badges.some((t) => PRESENTATION_RE.test(norm(t))),
       moreBtn: findMoreButton(row),
     };
   }
@@ -448,8 +527,8 @@
     if (info.isHost) return { ok: true, why: 'host' };
     if (info.isPresentation) return { ok: true, why: 'presentation' };
     if (cfg.exact.has(info.nameN)) return { ok: true, why: 'exact-whitelist' };
-    if (cfg.keywords.some((k) => info.nameN.includes(k))) return { ok: true, why: 'keyword-whitelist' };
-    if (cfg.required.some((k) => info.nameN.includes(k))) return { ok: true, why: 'required-hit' };
+    if (cfg.keywords.some((k) => containsCompleteMarker(info.nameN, k))) return { ok: true, why: 'keyword-whitelist' };
+    if (cfg.required.some((k) => containsCompleteMarker(info.nameN, k, isLatinLikeMarker(k)))) return { ok: true, why: 'required-hit' };
     return { ok: false, why: 'violation' };
   }
 
@@ -598,6 +677,7 @@
   class KickError extends Error { constructor(code) { super(code); this.code = code; } }
   const assertActive = (revision, inputAt) => {
     if (!alive() || !configReady || !cfg.enabled || cfg.dryRun || !cfg.required.length ||
+        Date.now() < state.pausedUntil ||
         revision !== configRevision || state.lastInput !== inputAt) throw new KickError('aborted');
   };
 
@@ -634,9 +714,11 @@
   function findRemoveItem(menu) {
     const cands = [...menu.querySelectorAll('[role^="menuitem"], li, button')];
     const leaves = cands.filter((el) => !cands.some((o) => o !== el && el.contains(o)));
+    // 批量处置选项出现时不做任何自动点击，即使同时存在普通“移出”。
+    if (leaves.some((el) => isVisible(el) && isBulkRemoval(norm(el.textContent)))) return null;
     const hits = leaves.filter((el) => {
       const text = norm(el.textContent);
-      if (!isVisible(el) || el.matches(':disabled, [aria-disabled="true"]') || !text || MENU_NEGATIVE_RE.test(text)) return false;
+      if (!isVisible(el) || el.matches(':disabled, [aria-disabled="true"]') || !text || MENU_NEGATIVE_RE.test(text) || isBulkRemoval(text)) return false;
       return REMOVE_TEXT_RES.some((re) => re.test(text)) || cfg.extraRemove.some((k) => text === k);
     });
     const el = hits.length === 1 ? hits[0] : null;
@@ -654,10 +736,12 @@
   const cancelButtons = (dialog) => visibleButtons(dialog).filter((b) => CANCEL_RE.test(norm(b.textContent)));
 
   function findConfirmButton(dialog) {
+    if (visibleButtons(dialog).some((b) => isBulkRemoval(norm(b.textContent)))) return null;
     const hits = visibleButtons(dialog).filter((b) =>
       !b.matches(':disabled, [aria-disabled="true"]') &&
       !CANCEL_RE.test(norm(b.textContent)) &&
       !MENU_NEGATIVE_RE.test(norm(b.textContent)) &&
+      !isBulkRemoval(norm(b.textContent)) &&
       DESTRUCTIVE_RE.test(norm(b.textContent)));
     // 不再猜测“非取消按钮”；举报/屏蔽或多个破坏性按钮均中止。
     return hits.length === 1 ? hits[0] : null;
@@ -689,7 +773,7 @@
   }
 
   async function kick(target) {
-    if (state.busy || !configReady || !cfg.enabled || !cfg.required.length) return; // 单飞：tick / 防抖采集 / 滚动扫描三个入口绝不允许并发处置
+    if (state.busy || !configReady || !cfg.enabled || !cfg.required.length || Date.now() < state.pausedUntil) return; // 单飞 + 安全熔断，对滚动扫描入口也有效
     const { key, name } = target;
 
     if (cfg.dryRun) {
@@ -823,15 +907,22 @@
     state.sweeping = true;
     const origin = sc.scrollTop;
     const startedAt = Date.now();
+    const sweepRevision = configRevision;
     const seen = new Set();
     let completed = false;
     try {
       sc.scrollTo({ top: 0, behavior: 'instant' });
       for (let i = 0; i < 300 && alive() && sc.isConnected; i++) {
+        if (!configReady || !cfg.enabled || Date.now() < state.pausedUntil ||
+            sweepRevision !== configRevision || state.lastInput > startedAt) break;
         await waitForQuiet(state.observedList);       // 等虚拟列表渲染稳定，而不是睡固定时间
+        // 等待期间用户可能开始操作或熔断被触发，必须先检查再处置。
+        if (!configReady || !cfg.enabled || Date.now() < state.pausedUntil ||
+            sweepRevision !== configRevision || state.lastInput > startedAt) break;
         const target = harvest(seen);
         if (target) await kick(target);                // 目标此刻就在视口内，直接处置
-        if (!cfg.enabled || state.lastInput > startedAt) break; // 用户一动手立刻让位
+        if (!configReady || !cfg.enabled || Date.now() < state.pausedUntil ||
+            sweepRevision !== configRevision || state.lastInput > startedAt) break;
         if (sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2) { completed = true; break; }
         // 步长 ≤ 70% 视口：相邻两屏必有重叠，不会漏掉被 overscan 之外的行
         sc.scrollTo({ top: sc.scrollTop + Math.max(60, Math.floor(sc.clientHeight * 0.7)), behavior: 'instant' });
@@ -910,6 +1001,6 @@
     }, { signal: life.signal });
 
     tick();
-    console.info(LOG, '巡检引擎已挂载 v1.0.0');
+    console.info(LOG, '巡检引擎已挂载 v1.0.1');
   })();
 })();

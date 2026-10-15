@@ -70,11 +70,11 @@
   <div class="fields">
     <label>名字必须包含
       <input type="text" id="requiredKeywords" placeholder="例如：AA，BB" autocomplete="off" />
-      <small>多个关键词用逗号分隔，满足任意一个即合规，不区分大小写和全半角。留空则不会移出任何人。</small>
+      <small>多个关键词用逗号分隔，满足任意一个即合规。AA张三、王五AA、AA-张三可通过；jdka laa、AAlice、AA123、张AA三、只有AA均不通过。必需关键词须在姓名前或后，且必须有实际姓名文字。忽略大小写及全半角；留空不移出。</small>
     </label>
     <label>关键词白名单
       <input type="text" id="keywordWhitelist" placeholder="例如：助教，TA" autocomplete="off" />
-      <small>名字里含有这些词的人直接放行。</small>
+      <small>命中完整标记才直接放行（英文标记不能嵌在其他英文词或数字中）；中文关键词仍可包含匹配。</small>
     </label>
     <label>姓名白名单
       <textarea id="exactWhitelist" rows="3" placeholder="每行一个完整姓名"></textarea>

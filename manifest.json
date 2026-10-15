@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MeetNameSentry - 参会命名准入守卫",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Google Meet 参会者命名规范巡检工具，支持必需关键字验证、精准白名单与全自动移出。",
   "permissions": [
     "storage"

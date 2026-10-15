@@ -1,4 +1,4 @@
-.DS_Store
+# Local credentials, tokens, and environment overrides must never be committed.
 .env
 .env.*
 !.env.example
@@ -6,3 +6,8 @@
 *.key
 *.p12
 *.pfx
+*.mobileprovision
+*.log
+node_modules/
+coverage/
+.DS_Store
