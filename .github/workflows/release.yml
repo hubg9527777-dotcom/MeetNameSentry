@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Version tag, for example v1.0.1'
-        required: true
-        default: 'v1.0.1'
 
 permissions:
   contents: write
@@ -17,50 +11,60 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
-      - name: Verify manifest version
-        env:
-          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      - name: Verify version and required files
         run: |
-          test -f manifest.json
-          VERSION=$(node -p "JSON.parse(require('fs').readFileSync('manifest.json', 'utf8')).version")
-          test "v$VERSION" = "$TAG" || {
-            echo "Version mismatch: manifest=$VERSION tag=$TAG"
-            exit 1
-          }
-          node --check content.js
-          node --check popup.js
+          set -euo pipefail
+          VERSION=$(node -p "require('./manifest.json').version")
+          test "v${VERSION}" = "${GITHUB_REF_NAME}"
+          for file in \
+            manifest.json content.js background.js popup.js popup.html \
+            mns-raf-experiment-main.js \
+            icons/icon.svg icons/icon16.png icons/icon32.png \
+            icons/icon48.png icons/icon128.png; do
+            test -f "$file" || { echo "Missing: $file"; exit 1; }
+          done
 
-      - name: Package extension
-        env:
-          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      - name: Run syntax checks and tests
         run: |
+          set -euo pipefail
+          for file in content.js background.js popup.js mns-raf-experiment-main.js; do
+            node --check "$file"
+          done
+          node --test ./*.test.cjs
+
+      - name: Package runtime extension files only
+        run: |
+          set -euo pipefail
           mkdir -p dist
-          zip -q -X "dist/MeetNameSentry-${TAG}.zip" \
+          zip -q -X "dist/MeetNameSentry-${GITHUB_REF_NAME}.zip" \
             manifest.json \
             content.js \
-            popup.js \
+            background.js \
             popup.html \
-            icons/*
-
-          unzip -t "dist/MeetNameSentry-${TAG}.zip"
+            popup.js \
+            mns-raf-experiment-main.js \
+            icons/icon.svg \
+            icons/icon16.png \
+            icons/icon32.png \
+            icons/icon48.png \
+            icons/icon128.png
+          unzip -t "dist/MeetNameSentry-${GITHUB_REF_NAME}.zip"
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.zip --clobber
-          else
-            gh release create "$TAG" dist/*.zip \
-              --title "MeetNameSentry $TAG" \
-              --generate-notes
+            echo "Release already exists: $TAG"
+            exit 1
           fi
+          gh release create "$TAG" dist/*.zip \
+            --title "MeetNameSentry $TAG" \
+            --notes '新增后台巡检和后台名单辅助功能，让隐藏或最小化的 Google Meet 继续检查参会者姓名，并按已有规则自动移出不合规人员。'

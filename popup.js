@@ -49,6 +49,8 @@ let ready = false;
 let timer = 0;
 const pendingText = new Set();
 let writeGeneration = 0;
+// 每个字段单独记录最新提交：旧请求返回不得清除新请求的失败状态。
+const latestFieldWrite = new Map();
 const failedFields = new Set();
 const textFieldIds = ['requiredKeywords', 'keywordWhitelist', 'exactWhitelist', 'extraRemoveLabels'];
 
@@ -59,6 +61,9 @@ function persist(fields) {
   const form = readForm();
   const payload = Object.fromEntries(fields.map((id) => [id, form[id]]));
   updateHints(form);
+  // 即使校验失败，也要使此前仍在飞行中的保存回调过期。
+  const generation = ++writeGeneration;
+  for (const id of fields) latestFieldWrite.set(id, generation);
   // sync.set 单条记录存在 8KiB 配额，提前拒绝，避免误显示已保存。
   const oversized = fields.find((id) => typeof form[id] === 'string' &&
     byteLen(id) + byteLen(JSON.stringify(form[id])) > ITEM_LIMIT);
@@ -66,12 +71,14 @@ function persist(fields) {
     failedFields.add(oversized);
     return setStatus(`保存失败：${oversized} 超过同步存储单项大小限制`, 'err');
   }
-  const generation = ++writeGeneration;
   setStatus('保存中…');
   chrome.storage.sync.set(payload, () => {
     const err = chrome.runtime.lastError;
-    if (err) fields.forEach((id) => failedFields.add(id));
-    else fields.forEach((id) => failedFields.delete(id));
+    for (const id of fields) {
+      if (latestFieldWrite.get(id) !== generation) continue;
+      if (err) failedFields.add(id);
+      else failedFields.delete(id);
+    }
     if (failedFields.size) return setStatus('保存失败：部分设置未写入，请重新操作并确认。', 'err');
     if (generation !== writeGeneration) return;
     if (!form.requiredKeywords.trim()) return setStatus('已保存。未设置必需关键词，不会移出任何人。', 'warn');
@@ -92,6 +99,9 @@ function flushText() {
 function scheduleSave(id) {
   if (!ready) return;
   pendingText.add(id);
+  // 新输入尚未防抖落盘，旧的成功回调不能将界面显示为已保存。
+  ++writeGeneration;
+  latestFieldWrite.set(id, writeGeneration);
   clearTimeout(timer);
   setStatus('保存中…');
   timer = setTimeout(flushText, 350);
@@ -132,3 +142,53 @@ for (const id of textFieldIds) {
 }
 // 页面关闭时尽力发出最后一次写入；异步完成与跨设备同步仍无法在关闭后保证。
 if (typeof window !== 'undefined') window.addEventListener('pagehide', flushText);
+
+// 正式后台名单辅助：新安装默认开启；用户关闭后跨重启保持关闭。
+// 与 AA 规则的 sync 存储完全分离。通过 Service Worker 串行管理动态 MAIN world 脚本。
+const rafToggle = $('rafEnabled');
+const rafStatus = $('rafStatus');
+if (rafToggle && rafStatus) {
+  let rafBusy = false;
+  let rafKnown = false;
+  let lastRafEnabled = true;
+  const rafProtocol = 'MNS_RAF_EXP_V102'; // 内部兼容标识；不影响旧版开关存储
+
+  const showRafStatus = (message, kind = '') => {
+    rafStatus.textContent = message;
+    rafStatus.className = kind;
+  };
+  const requestRaf = async (action) => {
+    if (!chrome.runtime?.sendMessage) throw new Error('后台服务不可用');
+    const reply = await chrome.runtime.sendMessage({protocol: rafProtocol, action});
+    if (!reply?.ok) throw new Error(reply?.error || '操作失败');
+    return reply;
+  };
+  const displayRaf = (reply) => {
+    lastRafEnabled = reply.enabled === true;
+    rafToggle.checked = lastRafEnabled;
+    rafKnown = true;
+    if (reply.registered !== lastRafEnabled) {
+      showRafStatus('状态同步中，请重新打开设置查看', 'warning');
+    } else {
+      showRafStatus(lastRafEnabled ? '已开启（默认开启）' : '已关闭');
+    }
+  };
+
+  rafToggle.disabled = true;
+  void requestRaf('STATUS').then(displayRaf).catch(() => {
+    rafKnown = false;
+    showRafStatus('无法读取状态，请重新打开设置', 'error');
+  }).finally(() => { rafToggle.disabled = !rafKnown || rafBusy; });
+
+  rafToggle.addEventListener('change', () => {
+    if (!rafKnown || rafBusy) { rafToggle.checked = lastRafEnabled; return; }
+    const desired = rafToggle.checked;
+    rafBusy = true;
+    rafToggle.disabled = true;
+    showRafStatus('正在保存…');
+    void requestRaf(desired ? 'ENABLE' : 'DISABLE').then(displayRaf).catch(() => {
+      rafToggle.checked = lastRafEnabled;
+      showRafStatus('保存失败，请再试一次', 'error');
+    }).finally(() => { rafBusy = false; rafToggle.disabled = !rafKnown; });
+  });
+}

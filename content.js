@@ -1,5 +1,5 @@
 /**
- * MeetNameSentry — content.js (v1.0.1)
+ * MeetNameSentry — content.js (v1.0.2)
  * Google Meet 命名纪律守卫（只有主持人 / 联席主持人才真正有“移出”权限）
  *
  * 设计原则
@@ -12,14 +12,38 @@
 (() => {
   'use strict';
 
-  if (window.__MEET_NAME_SENTRY__) return; // 防重复注入
-  window.__MEET_NAME_SENTRY__ = true;
+  // 同一个 Meet 页面里的静态注入与后台补注入可能相继到达。
+  // 健康实例仅唤醒，不并行建立第二套自动移出流程。
+  // 若仅有明确可终止且已经失效的本扩展实例，才允许清理后重新初始化。
+  const existing = window.__MEET_NAME_SENTRY__;
+  if (existing) {
+    let healthy = false;
+    try { healthy = typeof existing === 'object' && existing.alive?.() === true; }
+    catch { /* 扩展升级后旧上下文可能已经失效 */ }
+    if (healthy) {
+      try { existing.wake?.(); } catch { /* 仅唤醒；不会启动第二引擎 */ }
+      return;
+    }
+    // 未知的历史实例可能仍在控制移出操作，宁可跳过恢复，也不能双重点击。
+    if (typeof existing !== 'object' || typeof existing.shutdown !== 'function' ||
+        typeof existing.alive !== 'function') return;
+    try { existing.shutdown('清理失效的旧实例'); } catch { return; }
+    if (window.__MEET_NAME_SENTRY__ === existing) return;
+  }
 
   const LOG = '[MeetNameSentry]';
+  // 错误对象的 message/stack 可能包含第三方页面文字或会议 URL，日志仅输出受限错误类别。
+  const safeErrorKind = (error) => typeof error?.name === 'string' &&
+    /^[A-Za-z]{1,40}(?:Error|Exception)$/.test(error.name) ? error.name : 'unexpected-error';
+
 
   /* ════════════════════════ 0. 参数 ════════════════════════ */
   const T = {
-    tick: 1500,              // 主调度周期（后台标签页自动 ×3）
+    tick: 1500,              // 前台/后台共用的调度目标间隔；实际唤醒仍受 Chrome 节流约束
+    watchdog: 12_000,        // 独立于巡检周期的低频健康检查
+    staleCycle: 18_000,      // 没有正常巡检时尝试安全唤醒（不会并发移出）
+    configRetry: 15_000,     // 配置读失败后重试；失败期间永不自动移出
+    slowCycle: 45_000,       // 长时间未结束的周期仅标记异常，不并发启动另一轮
     harvestDebounce: 150,    // 列表变动 → 触发采集的防抖
     suspectStable: 1200,     // 同一目标须在 ≥1.2s 间隔内被两次判为不合规才动手（防瞬时脏数据）
     suspectTTL: 90_000,
@@ -33,10 +57,20 @@
     panelOpenRetry: 8_000,
     panelRender: 2_500,
     panelBackoff: 30_000,
+    hiddenRosterWarmup: 20_000, // 后台页面至少隐藏 20s 才考虑温和刷新
+    hiddenRosterInterval: 90_000, // 无人数提示时，每 90s 最多一次名单重挂载实验
+    hiddenRosterMismatchInterval: 40_000, // 人数角标与名单不符，可略微提前尝试
+    hiddenRosterMaxTries: 3, // 10 分钟最多尝试三次，防止隐藏页无效点击循环
     menu: 2_500,
     dialog: 3_000,
     closing: 4_000,
   };
+  // Claude 路线：保留 A3 重挂载函数供隔离实验，但默认不自动关闭已展开的人员面板。
+  // 真实 Meet 的 hidden 渲染并未被证明可由按钮重挂载恢复；避免陷入 close-not-confirmed。
+  const AUTO_HIDDEN_ROSTER_TOGGLE_EXPERIMENT = false;
+  const COVERAGE_MISMATCH_GRACE_MS = 5_000;
+  const RENDER_HEARTBEAT_FRESH_MS = 5_000;
+  const REFRESH_LOG_CAP = 12;
   const MAP_CAP = 500; // 所有 Map 的容量上限，防长会议内存增长
 
   // 若你实测确认“移出确认对话框一定带昵称”，可设为 true：对话框里找不到昵称前缀就中止
@@ -114,7 +148,23 @@
     panelStatus: '', cycling: false,
     coverage: null,
     listObserver: null, observedList: null,
-    tickTimer: 0, harvestTimer: 0,
+    tickTimer: 0, harvestTimer: 0, suspectReviewTimer: 0, lastBackgroundHarvestAt: 0,
+    watchdogTimer: 0, rootObserver: null, lastDomWakeAt: 0,
+    lastCycleAt: Date.now(), lastCycleStartAt: 0, lastConfigAttemptAt: 0,
+    lastPatrolAt: 0, // 只有成功解析到当前 Meet 参会者姓名时才更新时间，不把空循环当作健康巡检
+    // 匿名计数/阶段诊断：不存储姓名或会议链接。巡检存活不代表隐藏页能渲染动作菜单。
+    lastRawRows: 0, lastReadableRows: 0, lastViolations: 0, lastMissingAction: 0,
+    lastKickAttemptAt: 0, lastKickSuccessAt: 0, lastKickFailureAt: 0,
+    lastKickFailure: '', lastKickStage: 'none',
+    refreshingRoster: false, hiddenSince: document.hidden ? Date.now() : 0,
+    lastRosterRefreshAt: 0, rosterRefreshAttempts: 0, rosterRefreshWindowAt: 0,
+    rosterRefreshBefore: null, rosterRefreshAfter: null, rosterRefreshResult: 'not-attempted',
+    rosterRefreshEvidence: null,
+    rosterRefreshLog: [], rosterRefreshThrottle: '',
+    coverageMismatchSince: 0, coverageStatus: 'unknown',
+    lastCompleteCoverageAt: 0, lastCoverageAt: 0, lastCoverageHint: null,
+    renderFrameCount: 0, lastRenderFrameAt: 0, renderFrameRequest: 0,
+    lastTickStartedAt: 0, lastTickIntervalMs: null,
   };
 
   const DEFAULTS = {
@@ -190,6 +240,9 @@
     cfg.extraRemove = splitList(it.extraRemoveLabels, /[,，、;；\n]+/);
     // 规则变更 → 旧判定与退避全部作废
     state.suspects.clear(); state.hold.clear(); state.fails.clear();
+    clearTimeout(state.suspectReviewTimer); state.suspectReviewTimer = 0;
+    state.coverage = null; state.lastSweepAt = 0; state.lastSweepCount = null;
+    state.coverageMismatchSince = 0; state.coverageStatus = 'unknown';
     state.noRemoveStreak = 0; state.pausedUntil = 0;
     state.lastOpenAttempt = 0; state.openAttempts = []; state.panelRetryAt = 0;
     configRevision++;
@@ -197,6 +250,7 @@
   }
 
   const loadConfig = () => {
+    state.lastConfigAttemptAt = Date.now();
     const request = ++configRequest;
     // 从收到变更起就撤销旧动作授权；过期读取不能覆盖较新的配置。
     configReady = false;
@@ -243,29 +297,38 @@
 
   /**
    * 等待某个条件成立（取代 setTimeout(r, 400)）。
-   *  - MutationObserver：DOM 一变就（节流 30ms）重新探测，响应最快
+   *  - MutationObserver：前台 30ms 合并探测；后台直接由微任务响应真实 DOM 变化
    *  - 250ms 低频轮询：兜底“只改 class/style、不触发我们订阅的属性”的情况
    *  - timeout：永不无限等待；生命周期结束时立刻返回 null
    * 返回探针的真值，超时返回 null。
    */
   function waitFor(probe, { timeout = 3000, root = document.documentElement } = {}) {
     return new Promise((resolve) => {
-      let obs, poll, timer, queued = 0, settled = false;
+      let obs, poll, timer, debounceTimer = 0, queued = false, settled = false;
       const finish = (v) => {
         if (settled) return;
         settled = true;
-        obs.disconnect(); clearInterval(poll); clearTimeout(timer); clearTimeout(queued);
+        obs.disconnect(); clearInterval(poll); clearTimeout(timer); clearTimeout(debounceTimer);
         life.signal.removeEventListener('abort', onAbort);
         resolve(v || null);
       };
       const onAbort = () => finish(null);
       const check = () => {
-        queued = 0;
+        queued = false;
+        debounceTimer = 0;
+        if (settled) return;
         let v = null;
         try { v = probe(); } catch { /* 探针异常视为未命中 */ }
         if (v) finish(v);
       };
-      obs = new MutationObserver(() => { if (!queued) queued = setTimeout(check, 30); });
+      obs = new MutationObserver(() => {
+        if (settled || queued) return;
+        queued = true;
+        // 隐藏标签页的 setTimeout 可能被 Chrome 强力节流；DOM 已发生变化时直接用微任务检查。
+        // 仍仅在本页真实 DOM 变化时触发，不尝试绕过浏览器的冻结/丢弃机制。
+        if (document.hidden) queueMicrotask(check);
+        else debounceTimer = setTimeout(check, 30);
+      });
       obs.observe(root, {
         childList: true, subtree: true, attributes: true,
         attributeFilter: ['aria-expanded', 'aria-checked', 'aria-hidden', 'hidden', 'open', 'style', 'class'],
@@ -315,10 +378,52 @@
     }
   }
 
+  /** 渲染心跳：只观测 Chrome 是否交付真实动画帧，不伪造前台或改变 Meet 原生 API。 */
+  function onRenderFrame() {
+    if (!alive()) return;
+    state.renderFrameCount++;
+    state.lastRenderFrameAt = Date.now();
+    state.renderFrameRequest = requestAnimationFrame(onRenderFrame);
+  }
+  function startRenderHeartbeat() {
+    if (typeof requestAnimationFrame !== 'function' || state.renderFrameRequest) return;
+    state.renderFrameRequest = requestAnimationFrame(onRenderFrame);
+  }
+
+  /** 姓名覆盖健康：人数是辅助信号；一致也只代表计数对得上，不能保证姓名永远准确。 */
+  function assessRosterCoverage(now = Date.now(), hint = participantCount(), actualReadable = state.lastReadableRows) {
+    state.lastCoverageAt = now;
+    state.lastCoverageHint = hint;
+    if (!configReady || !cfg.enabled || !cfg.required.length) {
+      state.coverageMismatchSince = 0;
+      return (state.coverageStatus = 'inactive');
+    }
+    const readable = actualReadable;
+    const validHint = Number.isSafeInteger(hint) && hint > 0;
+    if (!validHint) {
+      state.coverageMismatchSince = 0;
+      return (state.coverageStatus = 'unknown');
+    }
+    // 如果已有完整滚动扫描，当前视口只有部分行不能直接当作缺人。
+    // 避免用几小时前的完整扫描，证明当前换人的会议名单仍然齐全。
+    const sweepComplete = state.coverage === `${hint}/${hint}` && !state.incomplete &&
+      state.lastSweepCount === hint && state.lastSweepAt > 0 &&
+      now >= state.lastSweepAt && now - state.lastSweepAt <= T.sweepInterval + T.sweepRetry;
+    if ((readable === hint && readable > 0) || sweepComplete) {
+      state.coverageMismatchSince = 0;
+      state.lastCompleteCoverageAt = now;
+      return (state.coverageStatus = 'count-consistent');
+    }
+    if (!state.coverageMismatchSince) state.coverageMismatchSince = now;
+    const elapsed = now - state.coverageMismatchSince;
+    return (state.coverageStatus = elapsed >= COVERAGE_MISMATCH_GRACE_MS ?
+      'blind' : 'mismatch-pending');
+  }
+
   /* ════════════════════════ 4. HUD（Shadow DOM，样式与 Meet 隔离） ════════════════════════ */
   const C = { ok: '#1e8e3e', warn: '#ea8600', err: '#d93025', idle: '#5f6368' };
   const hud = (() => {
-    let host = null, dot = null, txt = null, last = '';
+    let host = null, dot = null, txt = null, last = '', label = '', shade = C.idle;
     const ensure = () => {
       if (host && host.isConnected) return;
       host = document.createElement('div');
@@ -340,6 +445,7 @@
     };
     return {
       set(text, color = C.ok) { // 去重：内容没变就不碰 DOM
+        label = text; shade = color;
         const sig = `${text}|${color}`;
         ensure();
         if (sig === last) return;
@@ -347,7 +453,9 @@
         txt.textContent = `MeetNameSentry · ${text}`;
         dot.style.background = color;
       },
-      remove() { host?.remove(); host = null; },
+      // Google Meet 重新挂载 DOM 后，可把上一次真实状态恢复为可见 HUD。
+      restore() { if (label && (!host || !host.isConnected)) this.set(label, shade); },
+      remove() { host?.remove(); host = null; label = ''; },
     };
   })();
 
@@ -437,10 +545,23 @@
     return out;
   }
 
+  /**
+   * 后台页有时保留姓名行及其唯一菜单按钮，但 CSS 因无 hover 将按钮折叠为 0 个矩形。
+   * 只对【仍可见的目标行】里唯一、明确声明 aria-haspopup=menu 的按钮允许尝试逻辑点击。
+   * 不能把这个放宽到菜单项/确认按钮，更不能按坐标猜测目标。
+   */
+  function isOperableMoreButton(btn, row) {
+    if (!btn || !row || !btn.isConnected || !row.isConnected || !row.contains(btn)) return false;
+    if (btn.matches(':disabled, [aria-disabled="true"]') || btn.closest?.('[aria-hidden="true"], [inert]')) return false;
+    if (!isVisible(row)) return false;
+    if (isVisible(btn)) return true;
+    return document.hidden === true && /^(menu|true)$/.test(btn.getAttribute('aria-haspopup') || '');
+  }
+
   /** “更多操作”按钮：仅认菜单属性或明确的更多图标，不猜行内最后一个按钮。 */
   function findMoreButton(row) {
     const btns = [...row.querySelectorAll('button, [role="button"]')]
-      .filter((b) => isVisible(b) && !b.matches(':disabled, [aria-disabled="true"]'));
+      .filter((b) => isOperableMoreButton(b, row));
     // “更多操作”入口不唯一时拒绝猜测目标，防止界面改版后点错参会者。
     const explicit = btns.filter((b) => /^(menu|true)$/.test(b.getAttribute('aria-haspopup') || ''));
     if (explicit.length > 1) return null;
@@ -520,6 +641,27 @@
   const queryDialogs = () =>
     [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')].filter(isVisible);
 
+  /**
+   * Meet 的 Gemini 介绍、“会议已准备就绪”等提示可能以 dialog/menu 呈现。
+   * 它们不妨碍用户手动打开参与者面板，不应该永久阻止自动巡检。
+   * 但移出/举报、警告确认及正在编辑的窗口仍必须保持隔离。
+   * 该判断仅决定能否继续操作，绝不点击或关闭现有弹窗。
+   */
+  function blocksParticipantAutomation(overlay) {
+    if (!isVisible(overlay)) return false;
+    if (overlay.matches('[role="alertdialog"]')) return true;
+    const editable = [...overlay.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="textbox"]')]
+      .some((el) => isVisible(el) && !el.readOnly && el.getAttribute('readonly') === null);
+    if (editable) return true;
+    const description = norm([
+      overlay.getAttribute('aria-label'), overlay.getAttribute('title'), overlay.textContent,
+    ].filter(Boolean).join(' '));
+    return isBulkRemoval(description) || DESTRUCTIVE_RE.test(description) || MENU_NEGATIVE_RE.test(description);
+  }
+  function hasBlockingOverlay() {
+    return [...queryMenus(), ...queryDialogs()].some(blocksParticipantAutomation);
+  }
+
   /* ════════════════════════ 6. 合规判定 ════════════════════════ */
   function evaluate(info) {
     if (!info.nameN) return { ok: true, why: 'unreadable' };
@@ -553,13 +695,12 @@
     if (panelReady()) return true; // 手动打开后立即恢复，不受面板重试退避影响。
     state.panelStatus = '正在准备参与者面板';
     if (!alive() || !configReady || !cfg.enabled || !cfg.required.length) return false;
-    if (document.hidden) { state.panelStatus = '后台待命 · 返回页面后自动恢复'; return false; }
     if (userIsTyping() || Date.now() - state.lastInput < T.userBusy) {
       state.panelStatus = '等待当前输入结束后打开参与者面板';
       return false;
     }
-    if (queryMenus().length || queryDialogs().length) {
-      state.panelStatus = '等待当前菜单或对话框关闭';
+    if (hasBlockingOverlay()) {
+      state.panelStatus = '敏感操作窗口尚未关闭 · 等待安全恢复';
       return false;
     }
     const btn = peopleToggle();
@@ -593,6 +734,153 @@
     if (panelReady()) return true;
     state.panelStatus = '等待参与者名单渲染 · 自动重试';
     return false;
+  }
+
+  /**
+   * 以 Meet 的参与者面板本身确认展开状态，避免依赖某些布局不提供的 aria-expanded。
+   * 只承认唯一、可见、带真实参会者行的 data-panel-id=1 面板。
+   * 不读取其他弹窗或聊天区，不把人数角标误当作姓名。
+   */
+  function verifiedRosterPanel() {
+    const roots = [...document.querySelectorAll('[data-panel-id="1"]')]
+      .filter((root) => !isButtonLike(root) && isVisible(root));
+    if (roots.length !== 1) return null;
+    const root = roots[0];
+    const rows = [...root.querySelectorAll('[role="listitem"]')].filter(isVisible);
+    return rows.length ? { root, rows } : null;
+  }
+
+  /**
+   * 只接受能够用 Meet 人员按钮的语义或原生图标证明身份的开关。
+   * 某些布局的按钮没有 data-panel-id/aria-expanded，不能把缺少该属性当成“名单未展开”。
+   * 和唯一的可见人员面板交叉核对，仅用于非破坏性的收起/展开，不授权踢人。
+   */
+  function peopleToggleEvidence(btn) {
+    if (!btn || !btn.isConnected) return 'missing';
+    if (btn.getAttribute('data-panel-id') === '1') return 'panel-id';
+    const labelledBy = (btn.getAttribute('aria-labelledby') || '').split(/\s+/)
+      .map((id) => document.getElementById(id)?.textContent || '').join(' ');
+    const label = norm([
+      btn.getAttribute('aria-label'), btn.getAttribute('title'),
+      btn.getAttribute('data-tooltip'), btn.getAttribute('data-tooltip-text'), labelledBy,
+    ].filter(Boolean).join(' '));
+    if (label && !/\b(chat|messages?|messaging)\b|聊天|消息|訊息|チャット|メッセージ|채팅|메시지/i.test(label) &&
+        PEOPLE_LABEL_RE.test(label)) return 'people-label';
+    if (iconNames(btn).some((name) =>
+      ['people', 'group', 'groups', 'supervisor_account'].includes(name))) return 'people-icon';
+    return 'unverified';
+  }
+
+  /**
+   * 隐藏页面人员名单重挂载实验，针对人数角标已更新而 DOM 姓名行没更新。
+   * aria-pressed/expanded 可能不设置；此时只在唯一面板和可验证按钮的强证据下尝试。
+   * 在每次点击后检查真实面板 DOM 变化；任何不确定均停止，不盲点第二次。
+   */
+  async function maybeRefreshHiddenRoster() {
+    if (!alive() || !document.hidden || !configReady || !cfg.enabled || !cfg.required.length ||
+        state.busy || state.sweeping || state.refreshingRoster ||
+        Date.now() < state.pausedUntil || userIsTyping() ||
+        Date.now() - state.lastInput < T.idleBeforeSweep || hasBlockingOverlay()) return false;
+
+    const now = Date.now();
+    if (!state.hiddenSince) state.hiddenSince = now;
+    if (now - state.hiddenSince < T.hiddenRosterWarmup) return false;
+    const btn = peopleToggle();
+    const panel = verifiedRosterPanel();
+    const before = findRowsRaw().length;
+    const badge = participantCount();
+    const mismatch = badge !== null && badge > before;
+    const ariaOpen = !!btn && isPressed(btn);
+    const toggleEvidence = peopleToggleEvidence(btn);
+    // A2 要求 data-panel-id=1 是过度约束：有些 Meet 布局只提供 aria-label 或人员图标。
+    // 仅在有明确的人员按钮身份 + 唯一的可见名单面板 + 人数不匹配时允许非破坏性刷新。
+    const fallbackOpen = !!panel && mismatch &&
+      ['panel-id', 'people-label', 'people-icon'].includes(toggleEvidence);
+    // 只回传匿名校验证据，帮助区分“控制按钮不明”和“名单面板无法确认”。
+    state.rosterRefreshEvidence = {
+      toggleEvidence, panelVerified: !!panel, countMismatch: mismatch, ariaOpen,
+    };
+    if (!btn || (!ariaOpen && !fallbackOpen)) {
+      state.rosterRefreshResult = !btn ? 'no-people-toggle' :
+        !mismatch && !ariaOpen ? 'no-count-mismatch' : 'no-verified-open-toggle';
+      return false;
+    }
+    const cooldown = mismatch ? T.hiddenRosterMismatchInterval : T.hiddenRosterInterval;
+    if (state.lastRosterRefreshAt && now - state.lastRosterRefreshAt < cooldown) return false;
+    if (!mismatch && now - state.hiddenSince < T.hiddenRosterInterval) return false;
+    if (!state.rosterRefreshWindowAt || now - state.rosterRefreshWindowAt > 600_000) {
+      state.rosterRefreshWindowAt = now;
+      state.rosterRefreshAttempts = 0;
+    }
+    if (state.rosterRefreshAttempts >= T.hiddenRosterMaxTries) {
+      state.rosterRefreshThrottle = 'rate-limited';
+      return false;
+    }
+    const revision = configRevision, inputAt = state.lastInput;
+    const valid = () => alive() && configReady && cfg.enabled && !state.busy && !state.sweeping &&
+      revision === configRevision && state.lastInput === inputAt &&
+      Date.now() >= state.pausedUntil && btn.isConnected && document.hidden && !hasBlockingOverlay();
+    const scopedRows = () => {
+      const roots = [...document.querySelectorAll('[data-panel-id="1"]')]
+        .filter((root) => !isButtonLike(root) && isVisible(root));
+      if (roots.length !== 1) return null;
+      return [...roots[0].querySelectorAll('[role="listitem"]')].filter(isVisible).length;
+    };
+    if (!valid()) return false;
+    state.refreshingRoster = true;
+    state.lastRosterRefreshAt = now;
+    state.rosterRefreshAttempts++;
+    state.rosterRefreshBefore = before;
+    state.rosterRefreshAfter = null;
+    state.rosterRefreshThrottle = '';
+    state.rosterRefreshResult = 'closing';
+    try {
+      btn.click();
+      const closed = await waitFor(() => {
+        if (!valid()) return null;
+        if (ariaOpen && !isPressed(btn)) return 'closed';
+        const count = scopedRows();
+        return count === null || count === 0 ? 'closed' : null;
+      }, { timeout: 1800 });
+      if (!closed || !valid()) {
+        state.rosterRefreshResult = 'close-not-confirmed';
+        return false;
+      }
+      // DOM 已确认收起；同一按钮依然存在且没有其他交互，才重新展开。
+      state.rosterRefreshResult = 'reopening';
+      btn.click();
+      const reopened = await waitFor(() => {
+        if (!valid()) return null;
+        if (ariaOpen && isPressed(btn)) return 'opened';
+        const count = scopedRows();
+        return count !== null && count > 0 ? 'opened' : null;
+      }, { timeout: 1800 });
+      if (!reopened || !valid()) {
+        state.rosterRefreshResult = 'reopen-not-confirmed';
+        return false;
+      }
+      // 后台页面若仅恢复旧的一行，也如实记录无增长；不假装已经读到第二人的姓名。
+      await waitFor(() => findRowsRaw().length > before ? 'more-rows' : null, { timeout: T.panelRender });
+      if (!valid()) return false;
+      const after = findRowsRaw().length;
+      state.rosterRefreshAfter = after;
+      state.rosterRefreshResult = after > before ? 'rows-increased' :
+        after === 0 ? 'still-empty' : 'no-growth';
+      attachListObserver();
+      if (after) scheduleHarvest();
+      return after > before;
+    } catch {
+      state.rosterRefreshResult = 'refresh-error';
+      return false;
+    } finally {
+      state.rosterRefreshLog.push({
+        at: Date.now(), attempt: state.rosterRefreshAttempts,
+        before: state.rosterRefreshBefore, after: state.rosterRefreshAfter,
+        outcome: state.rosterRefreshResult,
+      });
+      if (state.rosterRefreshLog.length > REFRESH_LOG_CAP) state.rosterRefreshLog.shift();
+      state.refreshingRoster = false;
+    }
   }
 
   function participantCount() { // 人员按钮角标里的数字，仅作辅助信号
@@ -629,9 +917,17 @@
   function harvest(seen) {
     const now = Date.now();
     let ripe = null;
-    for (const info of readRows()) {
+    const entries = readRows();
+    state.lastRawRows = findRowsRaw().length;
+    state.lastReadableRows = entries.length;
+    state.lastViolations = 0;
+    state.lastMissingAction = 0;
+    if (entries.length) state.lastPatrolAt = now;
+    for (const info of entries) {
       seen?.add(info.key);
       if (evaluate(info).ok) { state.suspects.delete(info.key); continue; }
+      state.lastViolations++;
+      if (!info.moreBtn) state.lastMissingAction++;
       if (held(info.key, now)) continue;
 
       let s = state.suspects.get(info.key);
@@ -648,15 +944,41 @@
 
   function scheduleHarvest() {
     if (state.harvestTimer) return;
-    state.harvestTimer = setTimeout(async () => {
+    const check = async () => {
       state.harvestTimer = 0;
-      if (!alive() || state.busy || state.sweeping || !configReady || !cfg.enabled || !cfg.required.length) return;
+      if (!alive() || state.busy || state.sweeping || state.refreshingRoster || !configReady || !cfg.enabled || !cfg.required.length) return;
       if (Date.now() < state.pausedUntil) return;
       try {
         const t = harvest();
         if (t) await kick(t);
-      } catch (e) { console.error(LOG, e); }
-    }, T.harvestDebounce);
+        else if (document.hidden && !state.suspectReviewTimer) {
+          // 首次仅目击一次的违规姓名，需要独立二次复核；定时器只负责再次读取，绝不直接踢人。
+          const now = Date.now();
+          const waits = [...state.suspects.entries()]
+            .filter(([key, item]) => !held(key, now) && item.last >= now - T.suspectTTL &&
+              now - item.first < T.suspectStable)
+            .map(([, item]) => Math.max(20, T.suspectStable - (now - item.first) + 25));
+          if (waits.length) {
+            state.suspectReviewTimer = setTimeout(() => {
+              state.suspectReviewTimer = 0;
+              if (alive()) scheduleHarvest();
+            }, Math.min(...waits));
+          }
+        }
+      } catch (e) { console.error(LOG, '采集异常：', safeErrorKind(e)); }
+    };
+    if (document.hidden) {
+      // 后台列表 MutationObserver 已通知变化：无需等可能被节流到一分钟的定时器。
+      // 同时按真实时间限流，避免人数多时由持续 DOM 变化产生过多微任务。
+      const now = Date.now();
+      if (now - state.lastBackgroundHarvestAt < 200) return;
+      state.lastBackgroundHarvestAt = now;
+      // 使用哨兵防止同一轮 DOM 变化重复提交；嫌疑人仍需间隔 T.suspectStable 复核。
+      state.harvestTimer = -1;
+      queueMicrotask(check);
+    } else {
+      state.harvestTimer = setTimeout(check, T.harvestDebounce);
+    }
   }
 
   function pruneState() {
@@ -790,8 +1112,12 @@
     const revision = configRevision, inputAt = state.lastInput;
     const checkActive = () => assertActive(revision, inputAt);
     const baseline = { dialogs: new Set(queryDialogs()), menus: new Set(queryMenus()) };
-    if (baseline.dialogs.size || baseline.menus.size) return; // 不与用户已有操作交叉
+    // 普通提示弹窗可保持打开；本次操作只认相对于 baseline 新出现的菜单/确认框。
+    // 移出、举报、警告确认和编辑中的弹窗仍然完全阻止处置。
+    if ([...baseline.dialogs, ...baseline.menus].some(blocksParticipantAutomation)) return;
     const owned = { menu: null, dialog: null };
+    state.lastKickAttemptAt = Date.now();
+    state.lastKickStage = 'target-check';
     state.busy = true;
     hud.set(`🎯 处理中：${clip(name)}`, C.err);
 
@@ -799,15 +1125,17 @@
       checkActive();
       // ① 用 key 重新定位并复核（不信任采集时留下的节点引用）
       const first = locateTarget(target);
-      if (!first.moreBtn || !isVisible(first.moreBtn)) throw new KickError('stale');
+      if (!isOperableMoreButton(first.moreBtn, first.row)) throw new KickError('stale');
       first.row.scrollIntoView?.({ block: 'nearest', behavior: 'instant' });
 
       // ② 开菜单
+      state.lastKickStage = 'open-menu';
       const menu = await openMenu(first, baseline, checkActive);
       if (!menu) throw new KickError('menu-timeout');
       owned.menu = menu;
 
       // ③ 识别菜单项；找不到绝不乱点
+      state.lastKickStage = 'find-remove-item';
       const item = findRemoveItem(menu);
       if (!item) { dumpMenu(menu); throw new KickError('no-remove-item'); }
 
@@ -817,6 +1145,7 @@
       checkActive();
 
       // ⑤ 点“移出”，等确认对话框
+      state.lastKickStage = 'open-confirm-dialog';
       press(item);
       const dialog = await waitFor(() => {
         const fresh = queryDialogs().filter((d) => !baseline.dialogs.has(d));
@@ -829,6 +1158,7 @@
       }
 
       // ⑥ 举报复选框：取消勾选 → 复核；点确认前再做一次同步终检
+      state.lastKickStage = 'confirm-check';
       checkActive();
       if (!(await ensureNoReport(dialog, checkActive))) throw new KickError('report-box-stuck');
       const confirm = findConfirmButton(dialog);
@@ -840,11 +1170,15 @@
           !isVisible(dialog) || !dialog.contains(confirm) || findConfirmButton(dialog) !== confirm) {
         throw new KickError('stale');
       }
+      state.lastKickStage = 'submit-confirm';
       press(confirm);
 
       // ⑦ 以“对话框消失”作为成功信号
       if (!(await waitFor(() => !isVisible(dialog), { timeout: T.closing }))) throw new KickError('dialog-not-closed');
 
+      state.lastKickStage = 'completed';
+      state.lastKickSuccessAt = Date.now();
+      state.lastKickFailure = '';
       state.kicked++; state.noRemoveStreak = 0; state.fails.delete(key);
       markHold(key, T.postKickHold, 'kicked');
       hud.set(`✓ 已移出：${clip(name)}`, C.ok);
@@ -861,8 +1195,11 @@
 
   function onKickFailure(key, name, err) {
     const code = err instanceof KickError ? err.code : 'exception';
+    state.lastKickFailure = code;
+    state.lastKickFailureAt = Date.now();
     if (code === 'aborted') return;
-    if (!(err instanceof KickError)) console.error(LOG, err);
+    // 未预期异常可能携带 Meet DOM 文字、会议链接或参会者姓名，不输出异常正文/堆栈。
+    if (!(err instanceof KickError)) console.error(LOG, '未预期处置异常：', safeErrorKind(err));
     if (code === 'stale') { markHold(key, 3_000, code); return; } // 列表变了，不算故障
 
     const now = Date.now();
@@ -883,7 +1220,7 @@
 
   /* ════════════════════════ 10. 大型会议：滚动扫描（仅在必要且用户空闲时） ════════════════════════ */
   async function maybeSweep() {
-    if (state.busy || state.sweeping || document.hidden) return;
+    if (state.busy || state.sweeping || state.refreshingRoster) return;
     const list = state.observedList;
     if (!list || !list.isConnected) return;
     const sc = scrollParentOf(list);
@@ -913,6 +1250,8 @@
     try {
       sc.scrollTo({ top: 0, behavior: 'instant' });
       for (let i = 0; i < 300 && alive() && sc.isConnected; i++) {
+        // 在后台浏览器可能延迟虚拟列表渲染；限制一次扫描的墙上耗时以免长期占用调度器。
+        if (Date.now() - startedAt > 20_000) break;
         if (!configReady || !cfg.enabled || Date.now() < state.pausedUntil ||
             sweepRevision !== configRevision || state.lastInput > startedAt) break;
         await waitForQuiet(state.observedList);       // 等虚拟列表渲染稳定，而不是睡固定时间
@@ -938,25 +1277,45 @@
     }
   }
 
-  /* ════════════════════════ 11. 调度 ════════════════════════ */
+  /* ════════════════════════ 11. 调度与自恢复（不扩大扩展权限） ════════════════════════ */
   async function runCycle() {
     pruneState();
-    if (state.busy || state.sweeping) return; // 处置/扫描进行中，不开启并发周期。
-    if (!configReady) return hud.set('配置未就绪 · 自动操作已停止', C.warn);
+    if (state.busy || state.sweeping || state.refreshingRoster) return;
+    if (!configReady) return hud.set('配置未就绪 · 正在等待自动恢复', C.warn);
     if (!cfg.enabled) return hud.set('已暂停', C.warn);
     if (!cfg.required.length) return hud.set('未设置必需关键词 · 不执行移出', C.warn);
     if (Date.now() < state.pausedUntil) return hud.set(`已暂停：${state.pauseReason}`, C.err);
     if (!(await ensurePeoplePanel())) {
-      attachListObserver(); // 清理已卸载列表，重新打开时绑定新的列表。
-      return hud.set(state.panelStatus || '参与者名单未就绪 · 持续重试', C.idle);
+      attachListObserver();
+      // 隐藏页默认不执行收起/重开面板：UI 可能无法再渲染回来。
+      assessRosterCoverage();
+      return hud.set(state.panelStatus || '参与者名单未就绪 · 持续重试', C.warn);
     }
 
     attachListObserver();
     const target = harvest();
     if (target) await kick(target);
-    else await maybeSweep();
+    else {
+      await maybeSweep();
+      // A3 旧面板重挂载默认关闭，仅保留为隔离实验入口。
+      if (AUTO_HIDDEN_ROSTER_TOGGLE_EXPERIMENT && !state.busy && !state.sweeping &&
+          state.lastViolations === 0) await maybeRefreshHiddenRoster();
+    }
 
     if (!state.busy) {
+      // 扫描期间页面可能卸载人员面板，不能用旧的结果制造“巡检中”假正常状态。
+      if (!panelReady()) return hud.set('参与者名单已变化 · 正在自动恢复', C.idle);
+      const coverage = assessRosterCoverage();
+      if (coverage === 'blind') {
+        // countHint=3、readable=1 时明确承认盲区；绝不按缺失行或人数猜目标。
+        const hint = state.lastCoverageHint;
+        const where = document.hidden ? '后台' : '当前';
+        return hud.set(`${where}名单未同步 · 可读 ${state.lastReadableRows}/${hint} 人`, C.warn);
+      }
+      if (coverage === 'mismatch-pending')
+        return hud.set('参会者名单更新中 · 正在核对人数', C.warn);
+      if (coverage === 'unknown')
+        return hud.set('姓名巡检运行中 · 名单完整性未知', C.warn);
       const cov = state.coverage ? ` ${state.coverage}` : '';
       hud.set(cfg.dryRun ? `试运行 · 巡检中${cov}` : `巡检中${cov}`, cfg.dryRun ? C.warn : C.ok);
     }
@@ -966,41 +1325,192 @@
     if (state.cycling) return;
     if (!alive()) return shutdown('扩展上下文失效（扩展被重载/卸载）');
     state.cycling = true;
+    const tickNow = Date.now();
+    if (state.lastTickStartedAt) state.lastTickIntervalMs = tickNow - state.lastTickStartedAt;
+    state.lastTickStartedAt = tickNow;
+    state.lastCycleStartAt = tickNow;
     try { await runCycle(); }
-    catch (err) { console.error(LOG, '巡检周期异常（已隔离，下个周期继续）：', err); }
-    finally { state.cycling = false; }
-    if (alive()) state.tickTimer = setTimeout(tick, document.hidden ? T.tick * 3 : T.tick);
+    catch (err) {
+      console.error(LOG, '巡检周期异常（已隔离，下个周期继续）：', safeErrorKind(err));
+      hud.set('巡检异常 · 正在自动重试', C.warn);
+    } finally {
+      state.cycling = false;
+      state.lastCycleAt = Date.now();
+    }
+    if (alive()) state.tickTimer = setTimeout(tick, T.tick);
     else shutdown('扩展上下文失效');
+  }
+
+  // 浏览器真实恢复、名单突然重建等情况下唤醒调度器；
+  // 不会在处置/扫描进行中再启动另一轮，因此没有重复确认移出的风险。
+  function wake() {
+    if (!alive() || state.cycling || state.busy || state.sweeping) return;
+    clearTimeout(state.tickTimer);
+    state.tickTimer = 0;
+    queueMicrotask(tick);
+  }
+
+  function healthCheck() {
+    if (!alive()) return shutdown('扩展上下文失效');
+    hud.restore();
+    if (!configReady && Date.now() - state.lastConfigAttemptAt >= T.configRetry) {
+      // 从 Chrome storage 临时错误恢复；失败期间仍不会移出任何人。
+      void loadConfig().then(wake);
+      return;
+    }
+    if (state.cycling) {
+      if (Date.now() - state.lastCycleStartAt >= T.slowCycle) {
+        // 不得为“修复卡住”而并发点击另一个移出按钮。
+        hud.set('本轮巡检响应缓慢 · 等待安全恢复', C.warn);
+      }
+      return;
+    }
+    if (state.observedList && !state.observedList.isConnected) attachListObserver();
+    if (Date.now() - state.lastCycleAt >= T.staleCycle) wake();
   }
 
   function shutdown(reason) {
     if (life.signal.aborted) return;
     life.abort();
     clearTimeout(state.tickTimer); clearTimeout(state.harvestTimer);
-    state.listObserver?.disconnect();
+    clearTimeout(state.suspectReviewTimer); state.suspectReviewTimer = 0;
+    clearInterval(state.watchdogTimer);
+    if (state.renderFrameRequest && typeof cancelAnimationFrame === 'function')
+      cancelAnimationFrame(state.renderFrameRequest);
+    state.renderFrameRequest = 0;
+    state.listObserver?.disconnect(); state.rootObserver?.disconnect();
     try { chrome.storage.onChanged.removeListener(onStorageChanged); } catch { /* 上下文已失效 */ }
+    try { chrome.runtime.onMessage.removeListener(onHealthMessage); } catch { /* 上下文已失效 */ }
+    if (window.__MEET_NAME_SENTRY__ === instance) delete window.__MEET_NAME_SENTRY__;
     hud.remove();
     console.info(LOG, '已停止：', reason);
   }
 
-  /* ════════════════════════ 12. 启动 ════════════════════════ */
-  (async () => {
-    try { chrome.storage.onChanged.addListener(onStorageChanged); } catch { return; }
-    await loadConfig();
+  // 与 MV3 Service Worker 的最小化通信协议：不向后台传参会者姓名、名单或会议链接。
+  // 只有巡检引擎本身执行 DOM 检查、菜单确认和移出动作；后台仅判断存活并唤醒。
+  const HEALTH_PROTOCOL = 'MNS_HEALTH_V1';
+  function healthSnapshot() {
+    // 页面正在重绘、导航或卸载时 DOM 查询可能失败，不能因此让后台误以为脚本已经丢失。
+    let peopleButtonFound = false, peopleRowsVisible = false, blockingOverlay = false;
+    let participantCountHint = null, instantRawRows = null, instantReadableRows = null;
+    try {
+      peopleButtonFound = !!peopleToggle();
+      instantRawRows = findRowsRaw().length;
+      peopleRowsVisible = instantRawRows > 0;
+      instantReadableRows = readRows().length;
+      blockingOverlay = hasBlockingOverlay();
+      participantCountHint = participantCount();
+      // PING 使用当前 DOM 行数，而不是可能已经过时的最后一次巡检缓存。
+      // 仅读取数量，不返回姓名，也不触发任何移出操作。
+      assessRosterCoverage(Date.now(), participantCountHint, instantReadableRows);
+    } catch { /* 诊断失败不影响生命体征回复，也不授权移出 */ }
+    return {
+      protocol: HEALTH_PROTOCOL,
+      version: '1.0.2',
+      alive: alive(),
+      configReady,
+      enabled: configReady && cfg.enabled,
+      paused: Date.now() < state.pausedUntil,
+      busy: state.busy || state.sweeping || state.refreshingRoster || state.cycling,
+      lastCycleAt: state.lastCycleAt,
+      lastPatrolAt: state.lastPatrolAt,
+      // 仅供本扩展后台诊断；不传姓名、会议链接或人员明细。
+      pageHidden: document.hidden === true,
+      peopleButtonFound,
+      peopleRowsVisible,
+      blockingOverlay,
+      // 只读匿名统计；不包含姓名、参与者 ID 或会议链接。
+      rawRows: instantRawRows ?? state.lastRawRows,
+      readableRows: instantReadableRows ?? state.lastReadableRows,
+      violationRows: state.lastViolations,
+      missingActionButtons: state.lastMissingAction,
+      // 实验性后台名单重挂载数据：纯计数与枚举值，不包含参会姓名。
+      rosterRefreshAttempts: state.rosterRefreshAttempts,
+      rosterRefreshSecondsAgo: state.lastRosterRefreshAt ? Math.floor((Date.now() - state.lastRosterRefreshAt) / 1000) : null,
+      rosterRefreshBefore: state.rosterRefreshBefore,
+      rosterRefreshAfter: state.rosterRefreshAfter,
+      rosterRefreshResult: state.rosterRefreshResult,
+      rosterRefreshEvidence: state.rosterRefreshEvidence,
+      rosterRefreshThrottle: state.rosterRefreshThrottle,
+      rosterRefreshLog: state.rosterRefreshLog.slice(),
+      autoHiddenRosterToggle: AUTO_HIDDEN_ROSTER_TOGGLE_EXPERIMENT,
+      participantCountHint,
+      coverageStatus: state.coverageStatus,
+      coverageMismatchSeconds: state.coverageMismatchSince ? Math.floor((Date.now() - state.coverageMismatchSince) / 1000) : 0,
+      lastCompleteCoverageAt: state.lastCompleteCoverageAt,
+      renderAlive: state.lastRenderFrameAt ? Date.now() - state.lastRenderFrameAt <= RENDER_HEARTBEAT_FRESH_MS : null,
+      renderAgeSeconds: state.lastRenderFrameAt ? Math.floor((Date.now() - state.lastRenderFrameAt) / 1000) : null,
+      renderFrameCount: state.renderFrameCount,
+      lastRenderFrameAt: state.lastRenderFrameAt,
+      tickIntervalMs: state.lastTickIntervalMs,
+      dryRun: configReady ? cfg.dryRun : null,
+      kickStage: state.lastKickStage,
+      lastKickFailure: state.lastKickFailure,
+      lastKickAttemptAt: state.lastKickAttemptAt,
+      lastKickSuccessAt: state.lastKickSuccessAt,
+      lastKickFailureAt: state.lastKickFailureAt,
+    };
+  }
+  function onHealthMessage(message, sender, respond) {
+    // 即便日后增加对外消息能力，网页和其他扩展也不得唤醒/查询巡检引擎。
+    if (sender?.id !== chrome.runtime.id || sender?.tab) return false;
+    if (!message || message.protocol !== HEALTH_PROTOCOL ||
+        (message.action !== 'PING' && message.action !== 'WAKE')) return false;
+    if (message.action === 'WAKE' && alive() && !state.busy && !state.sweeping) {
+      healthCheck(); // 被后台唤醒时同步执行一次配置重试检查，而不依赖被节流的页面定时器。
+      wake();
+    }
+    respond(healthSnapshot());
+    return false; // 同步回复，避免让 Service Worker 长时间等待异步通道。
+  }
+  const instance = Object.freeze({ alive, wake, shutdown, protocol: HEALTH_PROTOCOL });
+  window.__MEET_NAME_SENTRY__ = instance;
+  try { chrome.runtime.onMessage.addListener(onHealthMessage); }
+  catch { /* 异常后由外围健康监护尝试重新注入 */ }
 
-    // 只认真人输入（isTrusted），我们自己派发的合成事件不算
+  /* ════════════════════════ 12. 启动与页面生命周期恢复 ════════════════════════ */
+  (async () => {
+    hud.set('正在启动巡检…', C.idle);
+    try { chrome.storage.onChanged.addListener(onStorageChanged); }
+    catch { hud.set('扩展权限暂不可用 · 请重新加载扩展', C.err); return; }
+
+    // 轻量 rAF 观测，不改变 Meet 的 visibilityState / 原生动画调度。
+    startRenderHeartbeat();
+    // 看门狗在加载配置之前启动：第一次 chrome.storage.sync.get() 失败也能自动重试。
+    state.watchdogTimer = setInterval(healthCheck, T.watchdog);
+    await loadConfig();
+    if (!alive()) return shutdown('扩展上下文失效');
+
     const markInput = (e) => { if (e.isTrusted) state.lastInput = Date.now(); };
     for (const type of ['wheel', 'pointerdown', 'keydown', 'touchstart', 'input', 'paste', 'compositionstart', 'compositionupdate', 'compositionend']) {
       document.addEventListener(type, markInput, { capture: true, passive: true, signal: life.signal });
     }
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden && !state.cycling && alive()) {
-        clearTimeout(state.tickTimer);
-        state.tickTimer = setTimeout(tick, 0);
-      }
+      state.hiddenSince = document.hidden ? Date.now() : 0;
+      wake();
     }, { signal: life.signal });
+    document.addEventListener('resume', wake, { signal: life.signal });
+    window.addEventListener('pageshow', wake, { signal: life.signal });
+    window.addEventListener('focus', wake, { signal: life.signal });
 
-    tick();
-    console.info(LOG, '巡检引擎已挂载 v1.0.1');
-  })();
+    // 等 Meet 挂载/重建参与者 DOM 时立即醒来，不等待后台节流后的定时器。
+    // 只在“尚未附着到可靠的名单”时生效，且每 3 秒最多唤醒一次。
+    state.rootObserver = new MutationObserver(() => {
+      if (!alive() || !configReady || !cfg.enabled || state.observedList?.isConnected) return;
+      if (state.cycling || state.busy || state.sweeping) return;
+      const now = Date.now();
+      if (now - state.lastDomWakeAt < 3_000) return;
+      if (!document.querySelector('[data-panel-id="1"] [role="listitem"], [role="list"] [role="listitem"]')) return;
+      state.lastDomWakeAt = now;
+      wake();
+    });
+    state.rootObserver.observe(document.documentElement, { childList: true, subtree: true });
+
+    wake();
+    console.info(LOG, '巡检引擎已挂载 v1.0.2');
+  })().catch((err) => {
+    console.error(LOG, '巡检引擎初始化异常：', safeErrorKind(err));
+    try { hud.set('启动异常 · 正在等待监护恢复', C.err); } catch { /* DOM 暂不可用 */ }
+    shutdown('启动失败，允许后台监护稍后安全补注入');
+  });
 })();

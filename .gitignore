@@ -1,4 +1,4 @@
-# Local credentials, tokens, and environment overrides must never be committed.
+# Secrets and machine-local configuration: never commit real credentials.
 .env
 .env.*
 !.env.example
@@ -6,8 +6,17 @@
 *.key
 *.p12
 *.pfx
-*.mobileprovision
-*.log
+*.jks
+*credentials*.json
+*secret*.json
+
+# Local working files and generated artifacts.
+.DS_Store
+Thumbs.db
 node_modules/
 coverage/
-.DS_Store
+.nyc_output/
+*.log
+*.tmp
+*.swp
+*.zip

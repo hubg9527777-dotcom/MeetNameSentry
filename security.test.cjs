@@ -20,9 +20,9 @@ function element(text = '', children = [], attributes = {}) {
 }
 
 function harness() {
-  const callbacks = [], logs = [], observers = [], timers = [];
+  const callbacks = [], logs = [], observers = [], timers = [], messageListeners = [];
   const document = {
-    querySelectorAll: () => [], getElementById: () => null,
+    querySelectorAll: () => [], querySelector: () => null, getElementById: () => null,
     body: element(), documentElement: element(), activeElement: null,
     createTreeWalker: (row) => { let read = false; return { nextNode: () => {
       if (read) return null; read = true;
@@ -33,9 +33,10 @@ function harness() {
     window: {}, document, NodeFilter: { SHOW_TEXT: 4 }, AbortController, Set, Map, Date, Object,
     MutationObserver: class { constructor(cb) { this.cb = cb; observers.push(this); } observe(root) { this.root = root; } disconnect() { this.disconnected = true; } },
     getComputedStyle: () => ({ visibility: 'visible' }),
-    chrome: { runtime: { id: 'test' }, storage: { sync: { get: (_defaults, cb) => callbacks.push(cb) } } },
+    chrome: { runtime: { id: 'test', onMessage: { addListener: (fn) => messageListeners.push(fn), removeListener: (fn) => { const i = messageListeners.indexOf(fn); if (i !== -1) messageListeners.splice(i, 1); } } }, storage: { sync: { get: (_defaults, cb) => callbacks.push(cb) } } },
     console: Object.fromEntries(['warn', 'log', 'info', 'error'].map((k) => [k, (...args) => logs.push(args)])),
     setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; }, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
+    queueMicrotask: (fn) => Promise.resolve().then(fn),
     KeyboardEvent: class {},
   });
   let source = fs.readFileSync(path.join(__dirname, 'content.js'), 'utf8');
@@ -45,7 +46,12 @@ function harness() {
     globalThis.api = {
       applyConfig, loadConfig, onStorageChanged, cfg, state, assertActive, locateTarget,
       norm, evaluate, readRow, containsCompleteMarker, findRemoveItem, findConfirmButton, kick, dismissOverlays, openMenu,
-      peopleToggle, findRowsRaw, findMoreButton, ensurePeoplePanel, attachListObserver, runCycle, tick,
+      harvest, isOperableMoreButton,
+      peopleToggle, findRowsRaw, findMoreButton, ensurePeoplePanel, maybeRefreshHiddenRoster, blocksParticipantAutomation,
+      hasBlockingOverlay, attachListObserver, runCycle, tick,
+      scheduleHarvest, maybeSweep, waitFor, healthCheck, healthSnapshot, wake, shutdown,
+      assessRosterCoverage, startRenderHeartbeat,
+      mockSweep: (fn) => { sweep = fn; },
       revision: () => configRevision, ready: () => configReady,
       rows: (rows) => { readRows = () => rows; },
       wait: (fn) => { waitFor = fn; },
@@ -54,7 +60,7 @@ function harness() {
     hud.set = () => {};
   })();`;
   vm.runInContext(source, context);
-  return { api: context.api, callbacks, context, document, logs, observers, timers };
+  return { api: context.api, callbacks, context, document, logs, observers, timers, messageListeners };
 }
 
 test('配置读取失败时停止，不能退回默认自动移出', async () => {
@@ -264,6 +270,7 @@ test('重复 key、目标换名或已合规均拒绝', () => {
 function kickFixture(h, change) {
   let clicks = 0;
   const row = element(), moreBtn = element();
+  row.contains = (b) => b === moreBtn;
   const target = { row, moreBtn, key: 'p1', name: 'PRIVATE-NAME', nameN: 'private-name' };
   const remove = element('Remove from call'), confirm = element('Remove');
   const menu = element('', [remove]), dialog = element('Remove PRIVATE-NAME?', [confirm]);
@@ -306,7 +313,10 @@ test('正常移出路径通过且控制台不含姓名', async () => {
 
 test('不接管已有菜单/对话框', async () => {
   const h = harness(); h.api.applyConfig({ dryRun: false });
-  h.document.querySelectorAll = () => [element()];
+  const activeConfirm = element('从通话中移出成员', [], {role:'alertdialog'});
+  activeConfirm.matches = (selector) => selector === '[role="alertdialog"]';
+  activeConfirm.querySelectorAll = () => [];
+  h.document.querySelectorAll = () => [activeConfirm];
   const f = kickFixture(h);
   await h.api.kick({ ...f.target });
   assert.equal(f.clicks(), 0);
@@ -334,12 +344,13 @@ test('设置读取失败时禁用表单且不保存默认值', () => {
   assert.match(fields.status.textContent, /读取配置失败/);
 });
 
-test('扩展资源存在，权限仅 storage，无远程脚本', () => {
+test('扩展资源存在，权限仅 storage/scripting/alarms，补注入范围只限 Meet', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8'));
-  assert.deepEqual(manifest.permissions, ['storage']);
-  assert.equal(manifest.host_permissions, undefined);
+  assert.deepEqual(manifest.permissions, ['storage', 'scripting', 'alarms']);
+  assert.deepEqual(manifest.host_permissions, ['https://meet.google.com/*']);
+  assert.deepEqual(manifest.background, { service_worker: 'background.js' });
   assert.deepEqual(manifest.content_scripts[0].matches, ['https://meet.google.com/*']);
-  const files = [manifest.action.default_popup, ...Object.values(manifest.icons), ...manifest.content_scripts.flatMap((s) => s.js)];
+  const files = [manifest.action.default_popup, manifest.background.service_worker, ...Object.values(manifest.icons), ...manifest.content_scripts.flatMap((s) => s.js)];
   for (const file of files) assert.ok(fs.existsSync(path.join(__dirname, file)), file);
   const html = fs.readFileSync(path.join(__dirname, manifest.action.default_popup), 'utf8');
   assert.match(html, /<script src="popup\.js"><\/script>/);
@@ -483,22 +494,110 @@ test('等待名单时关闭扩展不得继续返回巡检就绪', async () => {
   assert.equal(await h.api.ensurePeoplePanel(), false);
 });
 
-test('输入、后台、已有对话框、关闭巡检时不抢面板', async () => {
-  for (const mode of ['typing', 'hidden', 'dialog', 'disabled']) {
+test('输入、已有对话框、关闭巡检时不抢面板', async () => {
+  for (const mode of ['typing', 'dialog', 'disabled']) {
     const h = harness(), p = panelFixture(h);
     if (mode === 'typing') {
       h.document.activeElement = { tagName: 'INPUT' };
       h.api.state.lastInput = Date.now();
     }
-    if (mode === 'hidden') h.document.hidden = true;
     if (mode === 'disabled') h.api.applyConfig({ enabled: false });
     if (mode === 'dialog') {
       const query = h.document.querySelectorAll;
-      h.document.querySelectorAll = (selector) => selector.includes('alertdialog') && selector.includes('aria-modal') ? [element()] : query(selector);
+      const dangerous = element('确定要移出该参会者吗?', [], { role: 'alertdialog' });
+      h.document.querySelectorAll = (selector) => selector.includes('alertdialog') && selector.includes('aria-modal') ? [dangerous] : query(selector);
     }
     assert.equal(await h.api.ensurePeoplePanel(), false, mode);
     assert.equal(p.clicks(), 0, mode);
   }
+});
+
+test('后台标签页能主动打开参与者面板并等待名单渲染', async () => {
+  const h = harness(), p = panelFixture(h);
+  h.document.hidden = true;
+  h.api.wait(async (probe) => { p.show(); return probe(); });
+  assert.equal(await h.api.ensurePeoplePanel(), true);
+  assert.equal(p.clicks(), 1);
+});
+
+test('后台标签页已有名单时可直接识别，不依赖切回前台', async () => {
+  const h = harness(), p = panelFixture(h);
+  h.document.hidden = true;
+  p.show();
+  assert.equal(await h.api.ensurePeoplePanel(), true);
+  assert.equal(p.clicks(), 0);
+});
+
+test('后台 DOM 变化不依赖节流定时器即可发现并复核不合规姓名', async () => {
+  const h = harness();
+  h.document.hidden = true;
+  h.api.applyConfig({ requiredKeywords: 'AA', dryRun: true });
+  h.api.rows([{ key: 'n:jdka laa', name: 'jdka laa', nameN: 'jdka laa' }]);
+  h.api.scheduleHarvest();
+  assert.equal(h.api.state.harvestTimer, -1);
+  await Promise.resolve();
+  assert.equal(h.api.state.suspects.size, 1);
+  h.api.state.suspects.get('n:jdka laa').first -= 2000;
+  h.api.state.lastBackgroundHarvestAt -= 300;
+  h.api.scheduleHarvest();
+  await Promise.resolve();
+  assert.equal(h.api.state.dry.has('n:jdka laa'), true);
+  assert.equal(h.timers.some((t) => t.delay === 150), false);
+});
+
+test('后台标签页允许需要的滚动扫描，而不是直接跳过', async () => {
+  const h = harness();
+  h.document.hidden = true;
+  h.api.applyConfig({ requiredKeywords: 'AA' });
+  const sc = element();
+  sc.scrollHeight = 1300;
+  sc.clientHeight = 300;
+  h.context.getComputedStyle = () => ({ visibility: 'visible', overflowY: 'auto' });
+  h.api.state.observedList = sc;
+  let count = 0;
+  h.api.mockSweep(async () => { count++; });
+  await h.api.maybeSweep();
+  assert.equal(count, 1);
+});
+
+test('隐藏标签页的 waitFor 在 DOM 变化时以微任务响应，不依赖延迟轮询', async () => {
+  const h = harness();
+  h.document.hidden = true;
+  let ready = false;
+  const pending = h.api.waitFor(() => ready ? 'ready' : null);
+  const timerCount = h.timers.length;
+  ready = true;
+  h.observers.at(-1).cb();
+  assert.equal(await pending, 'ready');
+  assert.equal(h.timers.length, timerCount, '不应额外安排 30ms 的观察者定时器');
+});
+
+test('同一 Chrome Profile 的多个 Meet 页面各自拥有独立后台巡检状态', async () => {
+  const a = harness(), b = harness();
+  a.document.hidden = true;
+  b.document.hidden = true;
+  for (const h of [a, b]) h.api.applyConfig({ requiredKeywords: 'AA', dryRun: true });
+  a.api.rows([{ key: 'n:jdka laa', name: 'jdka laa', nameN: 'jdka laa' }]);
+  b.api.rows([{ key: 'n:AA张三', name: 'AA张三', nameN: 'aa张三' }]);
+  a.api.scheduleHarvest();
+  b.api.scheduleHarvest();
+  await Promise.resolve();
+  assert.equal(a.api.state.suspects.size, 1);
+  assert.equal(b.api.state.suspects.size, 0);
+  a.api.state.suspects.get('n:jdka laa').first -= 2000;
+  a.api.state.lastBackgroundHarvestAt -= 300;
+  a.api.scheduleHarvest();
+  await Promise.resolve();
+  assert.equal(a.api.state.dry.has('n:jdka laa'), true);
+  assert.equal(b.api.state.dry.size, 0);
+});
+
+test('后台定时巡检不再人为放大为三倍间隔', async () => {
+  const h = harness();
+  h.document.hidden = true;
+  h.api.applyConfig({ enabled: false });
+  await h.api.tick();
+  assert.equal(h.timers.at(-1).delay, 1500);
 });
 
 test('面板连续重试有节流，避免反复开关', async () => {
@@ -1007,4 +1106,647 @@ test('西语/葡语/法语/意语等批量移出不能命中单人移出或确�
   }
   assert.ok(h.api.findRemoveItem(element('', [element('Remove from call')])), '单人移出继续可用');
   assert.ok(h.api.findConfirmButton(element('', [element('Remove')])), '单人确认继续可用');
+});
+
+test('发布版本及运行时标识统一为 1.0.2', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8'));
+  const content = fs.readFileSync(path.join(__dirname, 'content.js'), 'utf8');
+  assert.equal(manifest.version, '1.0.2');
+  assert.match(content, /content\.js \(v1\.0\.2\)/);
+  assert.match(content, /巡检引擎已挂载 v1\.0\.2/);
+});
+
+// v1.0.2 完整安全复审：异步存储结果只能更新它对应的最新字段状态。
+function popupRaceHarness() {
+  const handlers = new Map();
+  const fields = Object.fromEntries(['status', 'size', 'enabled', 'dryRun',
+    'requiredKeywords', 'keywordWhitelist', 'exactWhitelist', 'extraRemoveLabels'].map((id) => [id, {
+    value: '', checked: false, disabled: false,
+    addEventListener(kind, cb) { handlers.set(`${id}:${kind}`, cb); },
+  }]));
+  const calls = [], runtime = {};
+  let deferred = null;
+  const context = {
+    document: { getElementById: (id) => fields[id] }, TextEncoder,
+    chrome: { runtime, storage: { sync: {
+      get: (defaults, cb) => cb(defaults),
+      set: (value, cb) => calls.push({ value, cb }),
+    } } },
+    setTimeout: (fn) => { deferred = fn; return 1; }, clearTimeout() {},
+    window: { addEventListener() {} },
+  };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, 'popup.js'), 'utf8'), context);
+  return { fields, handlers, calls, runtime, flush: () => deferred?.() };
+}
+
+test('同一安全开关较新保存失败时，较旧保存成功不能擦除失败提示', () => {
+  const h = popupRaceHarness();
+  h.fields.dryRun.checked = true;
+  h.handlers.get('dryRun:change')();
+  h.fields.dryRun.checked = false;
+  h.handlers.get('dryRun:change')();
+  assert.equal(h.calls.length, 2);
+  h.runtime.lastError = { message: 'quota exceeded' };
+  h.calls[1].cb();
+  delete h.runtime.lastError;
+  h.calls[0].cb();
+  assert.match(h.fields.status.textContent, /保存失败/);
+});
+
+test('新白名单超出容量后，旧的成功回调不能谎称超限白名单已保存', () => {
+  const h = popupRaceHarness();
+  h.fields.exactWhitelist.value = '张三';
+  h.handlers.get('exactWhitelist:input')();
+  h.handlers.get('exactWhitelist:change')();
+  assert.equal(h.calls.length, 1);
+  h.fields.exactWhitelist.value = '张'.repeat(3000);
+  h.handlers.get('exactWhitelist:input')();
+  h.handlers.get('exactWhitelist:change')();
+  assert.equal(h.calls.length, 1);
+  assert.match(h.fields.status.textContent, /超过同步存储/);
+  h.calls[0].cb();
+  assert.match(h.fields.status.textContent, /保存失败/);
+});
+
+test('文本新输入等待防抖时，旧保存回调不可提前显示已保存', () => {
+  const h = popupRaceHarness();
+  h.fields.exactWhitelist.value = '张三';
+  h.handlers.get('exactWhitelist:input')();
+  h.handlers.get('exactWhitelist:change')();
+  assert.equal(h.calls.length, 1);
+  h.fields.exactWhitelist.value = '张三\n李四';
+  h.handlers.get('exactWhitelist:input')();
+  h.calls[0].cb();
+  assert.match(h.fields.status.textContent, /保存中/);
+  h.flush();
+  assert.equal(h.calls.length, 2);
+  h.calls[1].cb();
+  assert.match(h.fields.status.textContent, /已保存/);
+});
+
+// v1.0.2 运行状态自检 / 安全恢复：与实际姓名匹配和移出流程独立。
+test('失去巡检调度且没有正在处置的任务时，看门狗唤醒周期', async () => {
+  const h = harness();
+  h.api.applyConfig({});
+  h.api.state.lastCycleAt = Date.now() - 40_000;
+  h.api.healthCheck();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(h.api.state.lastCycleAt > Date.now() - 5_000);
+  assert.ok(h.timers.some(({delay}) => delay === 1500));
+});
+
+test('巡检任务仍在执行时，即使超过阈值也不并发重启', async () => {
+  const h = harness(); h.api.applyConfig({});
+  h.api.state.cycling = true;
+  h.api.state.busy = true;
+  h.api.state.lastCycleAt = Date.now() - 100_000;
+  h.api.state.lastCycleStartAt = Date.now() - 100_000;
+  h.api.healthCheck();
+  h.api.wake();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.api.state.cycling, true);
+  assert.equal(h.timers.length, 0);
+});
+
+test('配置读取异常时自检能重新请求配置而非永久停机', async () => {
+  const h = harness();
+  const first = h.api.loadConfig();
+  h.context.chrome.runtime.lastError = { message: 'temporary' };
+  h.callbacks.shift()(undefined);
+  await first;
+  delete h.context.chrome.runtime.lastError;
+  assert.equal(h.api.ready(), false);
+  h.api.state.lastConfigAttemptAt = Date.now() - 20_000;
+  h.api.healthCheck();
+  assert.equal(h.callbacks.length, 1);
+  h.callbacks.shift()({ enabled: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.api.ready(), true);
+});
+
+test('即使配置无法读取，自恢复也不重新授权踢人', () => {
+  const h = harness();
+  const rev = h.api.revision();
+  h.api.state.lastConfigAttemptAt = Date.now() - 20_000;
+  h.api.healthCheck();
+  assert.equal(h.api.ready(), false);
+  assert.throws(() => h.api.assertActive(rev, 0), /aborted/);
+});
+
+test('失效的会话卸载看门狗并移除活跃实例标识', () => {
+  const h = harness();
+  assert.ok(h.context.window.__MEET_NAME_SENTRY__);
+  h.api.shutdown('test');
+  assert.equal(h.context.window.__MEET_NAME_SENTRY__, undefined);
+  assert.equal(h.api.state.cycling, false);
+});
+
+test('重复注入遇到既有健康实例只唤醒，不创建第二引擎', () => {
+  const h = harness();
+  let count = 0;
+  h.context.window.__MEET_NAME_SENTRY__ = { alive: () => true, wake: () => count++ };
+  let src = fs.readFileSync(path.join(__dirname, 'content.js'), 'utf8');
+  const pos = src.indexOf('  /* ════════════════════════ 12. 启动');
+  src = src.slice(0, pos) + '})();';
+  vm.runInContext(src, h.context);
+  assert.equal(count, 1);
+  assert.equal(h.context.window.__MEET_NAME_SENTRY__.alive(), true);
+});
+
+
+test('后台状态请求不会暴露姓名，也不会自动执行踢人', () => {
+  const h = harness();
+  assert.equal(h.messageListeners.length, 1);
+  let payload;
+  const sync = h.messageListeners[0]({ protocol: 'MNS_HEALTH_V1', action: 'PING' }, {id:'test'}, (p) => { payload = p; });
+  assert.equal(sync, false);
+  assert.equal(payload.protocol, 'MNS_HEALTH_V1');
+  assert.equal(payload.version, '1.0.2');
+  assert.equal(payload.alive, true);
+  assert.equal(payload.configReady, false);
+  assert.equal(payload.enabled, false);
+  assert.equal('name' in payload, false);
+  assert.equal('meetingUrl' in payload, false);
+  assert.equal('participants' in payload, false);
+  assert.equal(h.timers.length, 0);
+});
+
+test('后台只能发送唤醒，不能越过已暂停或未加载的规则', async () => {
+  const h = harness();
+  let payload;
+  const sync = h.messageListeners[0]({ protocol: 'MNS_HEALTH_V1', action: 'WAKE' }, {id:'test'}, (p) => { payload = p; });
+  assert.equal(sync, false);
+  assert.equal(payload.enabled, false);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.api.cfg.enabled, false);
+  assert.equal(h.api.ready(), false);
+});
+
+test('关闭巡检实例时注销后台心跳监听，避免重复引擎回调', () => {
+  const h = harness();
+  assert.equal(h.messageListeners.length, 1);
+  h.api.shutdown('test');
+  assert.equal(h.messageListeners.length, 0);
+});
+
+// 普通信息弹窗不能再拦住参与者入口：对应 Gemini 提示与入会邀请提示。
+for (const name of ['可以使用 Gemini 了解详情 不再显示', '会议已准备就绪 添加其他人 复制会议链接']) {
+  test(`普通提示弹窗允许自动打开人员面板：${name.slice(0, 12)}`, async () => {
+    const h = harness(), p = panelFixture(h);
+    const info = element(name, [], {role:'dialog'});
+    info.querySelectorAll = () => [];
+    const query = h.document.querySelectorAll;
+    h.document.querySelectorAll = (sel) => sel.includes('alertdialog') && sel.includes('aria-modal') ? [info] : query(sel);
+    h.api.wait(async (probe) => { p.show(); return probe(); });
+    assert.equal(h.api.hasBlockingOverlay(), false);
+    assert.equal(await h.api.ensurePeoplePanel(), true);
+    assert.equal(p.clicks(), 1);
+  });
+}
+
+test('已有普通提示弹窗不会妨碍单人移出流程进入目标定位', async () => {
+  const h = harness(); h.api.applyConfig({dryRun:false});
+  const f = kickFixture(h);
+  const info = element('会议已准备就绪', [], {role:'dialog'});
+  info.querySelectorAll = () => [];
+  const query = h.document.querySelectorAll;
+  h.document.querySelectorAll = (sel) => sel.includes('alertdialog') && sel.includes('aria-modal') ? [info] : query(sel);
+  // kickFixture 的模拟不要求真实菜单；检查弹窗不再在 baseline 处被跳过。
+  await h.api.kick({ ...f.target });
+  assert.ok(f.clicks() > 0, '普通邀请窗口不会导致零次尝试');
+});
+
+test('敏感移出确认、alertdialog、输入表单继续阻止自动点击人员按钮', async () => {
+  for (const type of ['destructive', 'alert', 'editing']) {
+    const h = harness(), p = panelFixture(h);
+    const overlay = element(type === 'destructive' ? '是否移出这个人 Remove from call?' : '普通提示', [], {role: type === 'alert' ? 'alertdialog':'dialog'});
+    if (type === 'alert') overlay.matches = (sel) => sel === '[role="alertdialog"]';
+    const input = element('', [], {role: 'input'});
+    overlay.querySelectorAll = (sel) => type === 'editing' && sel.includes('input') ? [input] : [];
+    if (type === 'editing') input.getAttribute = (k) => null;
+    const query = h.document.querySelectorAll;
+    h.document.querySelectorAll = (sel) => sel.includes('alertdialog') && sel.includes('aria-modal') ? [overlay] : query(sel);
+    assert.equal(h.api.hasBlockingOverlay(), true, type);
+    assert.equal(await h.api.ensurePeoplePanel(), false, type);
+    assert.equal(p.clicks(), 0, type);
+  }
+});
+
+
+test('健康快照区分循环存活与真正的名单巡检，不泄露姓名', () => {
+  const h = harness(); h.api.applyConfig({dryRun:true});
+  const before = h.api.healthSnapshot();
+  assert.equal(before.lastPatrolAt, 0);
+  assert.equal(before.peopleRowsVisible, false);
+  h.api.rows([{key:'n:私人姓名', name:'PRIVATE-NAME', nameN:'private-name'}]);
+  h.api.state.suspects.clear();
+  // 仅 harvest 实际读取到姓名后才有成功巡检心跳。
+  h.api.scheduleHarvest();
+  assert.equal(h.api.state.lastPatrolAt, 0);
+  assert.doesNotMatch(JSON.stringify(before), /PRIVATE-NAME|私人姓名/);
+});
+
+
+test('隐藏页仅允许目标行内唯一显式菜单按钮在折叠时逻辑点击，不放开确认按钮', () => {
+  const h = harness();
+  const row = element();
+  const button = element('', [], {'aria-haspopup':'menu'});
+  row.contains = (b) => b === button;
+  row.querySelectorAll = () => [button];
+  button.getClientRects = () => [];
+  h.document.hidden = true;
+  assert.equal(h.api.findMoreButton(row), button);
+  assert.equal(h.api.isOperableMoreButton(button, row), true);
+  h.document.hidden = false;
+  assert.equal(h.api.findMoreButton(row), null);
+});
+
+test('隐藏页多个折叠菜单候选必须跳过，不能猜测', () => {
+  const h = harness(); h.document.hidden = true;
+  const row = element();
+  const a = element('', [], {'aria-haspopup':'menu'});
+  const b = element('', [], {'aria-haspopup':'menu'});
+  a.getClientRects = () => []; b.getClientRects = () => [];
+  row.contains = (x) => x === a || x === b;
+  row.querySelectorAll = () => [a,b];
+  assert.equal(h.api.findMoreButton(row), null);
+});
+
+test('隐藏页不允许跨行的按钮或不具显式菜单属性的折叠按钮', () => {
+  const h = harness(); h.document.hidden = true;
+  const row = element();
+  const a = element('', [], {'aria-haspopup':'menu'});
+  const b = element('more_vert');
+  a.getClientRects = () => []; b.getClientRects = () => [];
+  row.contains = (x) => x === b;
+  row.querySelectorAll = () => [a,b];
+  assert.equal(h.api.isOperableMoreButton(a, row), false);
+  assert.equal(h.api.findMoreButton(row), null);
+});
+
+test('健康诊断报告后台候选行和停顿阶段，但不传姓名与会议链接', () => {
+  const h = harness(); h.api.applyConfig({ dryRun: false });
+  const row = element(); const button = element(); row.contains = (b) => b === button;
+  h.api.rows([{ row, moreBtn: null, name:'敏感参会姓名', nameN:'sensitive', key:'n:sensitive' }]);
+  h.api.harvest();
+  const payload = h.api.healthSnapshot();
+  assert.equal(payload.readableRows, 1);
+  assert.equal(payload.violationRows, 1);
+  assert.equal(payload.missingActionButtons, 1);
+  assert.equal(payload.dryRun, false);
+  assert.equal(payload.kickStage, 'none');
+  assert.doesNotMatch(JSON.stringify(payload), /敏感参会姓名|sensitive|meet\.google\.com/);
+});
+
+// 方案 A：后台已打开人员面板时，进行受限关闭/重新展开，测试不依赖 Meet 私有接口。
+function hiddenRosterFixture(opts = {}) {
+  const h = harness();
+  h.api.applyConfig({ requiredKeywords: 'AA', dryRun: true });
+  h.document.hidden = true;
+  h.api.state.hiddenSince = Date.now() - 120_000;
+  const attrs = {
+    role: 'button', 'data-panel-id': '1',
+    ...(opts.noExpanded ? {} : { 'aria-expanded': 'true' }),
+  };
+  const btn = element(String(opts.count ?? 3), [], attrs);
+  btn.getAttribute = (name) => attrs[name] ?? null;
+  const root = element();
+  const beforeRows = (opts.zero ? [] : [element('AA张三')]);
+  let shownRows = [...beforeRows], clicks = 0, open = true;
+  root.querySelectorAll = () => shownRows;
+  btn.click = () => {
+    clicks++;
+    if (opts.noToggle) return;
+    open = !open;
+    if (!opts.noExpanded) attrs['aria-expanded'] = String(open);
+    if (!open) shownRows = [];
+    else shownRows = opts.noGrowth ? [...beforeRows] : [...beforeRows, element('jdka laa')];
+  };
+  const query = h.document.querySelectorAll;
+  h.document.querySelectorAll = sel => {
+    if (sel === 'button, [role="button"]') return [btn];
+    if (sel === '[data-panel-id="1"]') return [root];
+    if (sel === '[role="list"] [role="listitem"]') return shownRows;
+    return query(sel);
+  };
+  h.api.wait(async probe => probe());
+  return { h, btn, clicks: () => clicks, visibleRows: () => shownRows.length };
+}
+
+test('方案A：后台名单人数角标大于 DOM 时，有限次重挂载并记录新增的行', async () => {
+  const f = hiddenRosterFixture();
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), true);
+  assert.equal(f.clicks(), 2);
+  assert.equal(f.h.api.state.rosterRefreshBefore, 1);
+  assert.equal(f.h.api.state.rosterRefreshAfter, 2);
+  assert.equal(f.h.api.state.rosterRefreshResult, 'rows-increased');
+  assert.equal(f.h.api.state.refreshingRoster, false);
+});
+
+test('方案A：普通无人数角标时到期后再尝试，不能因每轮巡检频繁切换面板', async () => {
+  const f = hiddenRosterFixture({count:null});
+  f.btn.textContent = '';
+  f.h.api.state.hiddenSince = Date.now() - 30_000;
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.clicks(), 0);
+  f.h.api.state.hiddenSince = Date.now() - 100_000;
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), true);
+  assert.equal(f.clicks(), 2);
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.clicks(), 2);
+});
+
+test('方案A改进：已展开的唯一人员面板有姓名行、人数有差异，缺少 aria-expanded 仍可重挂载', async () => {
+  const f = hiddenRosterFixture({noExpanded:true, count:2});
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), true);
+  assert.equal(f.clicks(), 2);
+  assert.equal(f.h.api.state.rosterRefreshBefore, 1);
+  assert.equal(f.h.api.state.rosterRefreshAfter, 2);
+  assert.equal(f.h.api.state.rosterRefreshResult, 'rows-increased');
+});
+
+test('方案A改进：无 aria 状态、关闭后 DOM 没变化，绝不盲点第二次', async () => {
+  const f = hiddenRosterFixture({noExpanded:true, noToggle:true, count:2});
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.clicks(), 1);
+  assert.equal(f.h.api.state.rosterRefreshResult, 'close-not-confirmed');
+});
+
+test('方案A3：无 panel-id/aria，但明确标记参与者的按钮可安全重挂载', async () => {
+  const f = hiddenRosterFixture({noExpanded:true, count:2});
+  f.btn.getAttribute = (name) => name === 'data-panel-id' ? null :
+    name === 'aria-label' ? '参与者 2' : ({ role: 'button' }[name] || null);
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), true);
+  assert.equal(f.clicks(), 2);
+  assert.equal(f.h.api.state.rosterRefreshResult, 'rows-increased');
+  const proof = f.h.api.healthSnapshot().rosterRefreshEvidence;
+  assert.equal(proof.toggleEvidence, 'people-label');
+  assert.equal(proof.panelVerified, true);
+  assert.equal(proof.countMismatch, true);
+});
+
+test('方案A3：语义按钮虽明确，但点击没有收起效果时绝不执行第二次点击', async () => {
+  const f = hiddenRosterFixture({noExpanded:true, count:2, noToggle:true});
+  f.btn.getAttribute = (name) => name === 'data-panel-id' ? null :
+    name === 'aria-label' ? 'Participants 2' : ({ role: 'button' }[name] || null);
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.clicks(), 1);
+  assert.equal(f.h.api.state.rosterRefreshResult, 'close-not-confirmed');
+});
+
+test('方案A3：无明确人员按钮身份时不执行重挂载', async () => {
+  const f = hiddenRosterFixture({noExpanded:true, count:2});
+  f.btn.getAttribute = (name) => name === 'data-panel-id' ? null :
+    name === 'aria-label' ? '未知窗口' : ({ role: 'button' }[name] || null);
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.clicks(), 0);
+  assert.equal(f.h.api.state.rosterRefreshResult, 'no-people-toggle');
+});
+
+test('方案A改进：无 aria 状态，按钮不指向 data-panel-id=1 时不得猜测', async () => {
+  const f = hiddenRosterFixture({noExpanded:true, count:2});
+  f.btn.getAttribute = name => name === 'data-panel-id' ? null : ({role:'button'}[name] || null);
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.clicks(), 0);
+  assert.equal(f.h.api.state.rosterRefreshResult, 'no-people-toggle');
+});
+
+test('方案A改进：无 aria 状态，人数未显示缺口时不得强制重挂载', async () => {
+  const f = hiddenRosterFixture({noExpanded:true, count:1});
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.clicks(), 0);
+  assert.equal(f.h.api.state.rosterRefreshResult, 'no-count-mismatch');
+});
+
+test('方案A改进：无 aria 状态，有两个疑似人员面板时拒绝操作', async () => {
+  const f = hiddenRosterFixture({noExpanded:true, count:3});
+  const previous = f.h.document.querySelectorAll;
+  f.h.document.querySelectorAll = selector => selector === '[data-panel-id="1"]'
+    ? [element('a', [element('Alice')]), element('b', [element('Bob')])]
+    : previous(selector);
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.clicks(), 0);
+  assert.equal(f.h.api.state.rosterRefreshResult, 'no-verified-open-toggle');
+});
+
+
+test('方案A：关闭面板后没有确认 aria 状态变化，最多点击一次，绝不盲点两次', async () => {
+  const f = hiddenRosterFixture({noToggle:true});
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.clicks(), 1);
+  assert.equal(f.h.api.state.rosterRefreshResult, 'close-not-confirmed');
+});
+
+test('方案A：显示页面、移出中、熔断时不触碰面板', async () => {
+  const f = hiddenRosterFixture();
+  const h = f.h;
+  h.document.hidden = false;
+  assert.equal(await h.api.maybeRefreshHiddenRoster(), false);
+  h.document.hidden = true;
+  h.api.state.busy = true;
+  assert.equal(await h.api.maybeRefreshHiddenRoster(), false);
+  h.api.state.busy = false;
+  h.api.state.pausedUntil = Date.now() + 30_000;
+  assert.equal(await h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.clicks(), 0);
+});
+
+test('方案A：检测到危险确认弹窗时不打开或关闭人员面板', async () => {
+  const f = hiddenRosterFixture();
+  const danger = element('Remove from call?', [], {role:'alertdialog'});
+  danger.matches = sel => sel === '[role="alertdialog"]';
+  const old = f.h.document.querySelectorAll;
+  f.h.document.querySelectorAll = sel => sel.includes('alertdialog') && sel.includes('aria-modal') ? [danger] : old(sel);
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.clicks(), 0);
+});
+
+test('方案A：三次无增长必须限流，不能每轮隐藏巡检都反复切面板', async () => {
+  const f = hiddenRosterFixture({noGrowth:true});
+  const h = f.h;
+  h.api.state.rosterRefreshWindowAt = Date.now();
+  h.api.state.rosterRefreshAttempts = 3;
+  assert.equal(await h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.clicks(), 0);
+  assert.equal(h.api.state.rosterRefreshThrottle, 'rate-limited');
+  assert.equal(h.api.state.rosterRefreshResult, 'not-attempted'); // 不覆盖上次失败原因
+});
+
+test('方案A：配置变化发生在关闭人员面板等待期间，不能继续第二次点击', async () => {
+  const f = hiddenRosterFixture(), h = f.h;
+  h.api.wait(async probe => {
+    h.api.applyConfig({ enabled:false });
+    return probe();
+  });
+  assert.equal(await h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.clicks(), 1);
+  assert.equal(h.api.cfg.enabled, false);
+});
+
+test('方案A：只提供匿名刷新计数、结果，不向后台发送姓名', async () => {
+  const f = hiddenRosterFixture();
+  await f.h.api.maybeRefreshHiddenRoster();
+  const result = f.h.api.healthSnapshot();
+  assert.equal(result.rosterRefreshBefore, 1);
+  assert.equal(result.rosterRefreshAfter, 2);
+  assert.equal(result.rosterRefreshResult, 'rows-increased');
+  assert.doesNotMatch(JSON.stringify(result), /张三|jdka laa|meet\.google\.com/);
+});
+
+test('Claude 默认策略：后台空名单不再自动收起人员面板', async () => {
+  const f = hiddenRosterFixture({zero:true});
+  await f.h.api.runCycle();
+  assert.equal(f.clicks(), 0);
+  assert.equal(f.h.api.state.rosterRefreshBefore, null);
+  assert.equal(f.h.api.state.rosterRefreshAfter, null);
+  assert.equal(f.h.api.healthSnapshot().autoHiddenRosterToggle, false);
+});
+
+test('方案A：重挂载后人数未增长时如实记录 no-growth，且不会重复立即操作', async () => {
+  const f = hiddenRosterFixture({noGrowth:true});
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.h.api.state.rosterRefreshResult, 'no-growth');
+  assert.equal(f.clicks(), 2);
+  await f.h.api.maybeRefreshHiddenRoster();
+  assert.equal(f.clicks(), 2);
+});
+
+// Claude 路线：将巡检活跃与覆盖完整性拆开，无姓名/ID泄露。
+test('Claude 覆盖判据：人数3仅读到1人超过5秒明确为 blind', () => {
+  const h = harness(); h.api.applyConfig({requiredKeywords:'AA'});
+  h.api.state.lastReadableRows = 1;
+  assert.equal(h.api.assessRosterCoverage(100_000, 3), 'mismatch-pending');
+  assert.equal(h.api.assessRosterCoverage(104_999, 3), 'mismatch-pending');
+  assert.equal(h.api.assessRosterCoverage(105_000, 3), 'blind');
+  assert.equal(h.api.state.lastCompleteCoverageAt, 0);
+  assert.equal(h.api.state.coverageMismatchSince, 100_000);
+});
+
+test('Claude 覆盖判据：新增姓名更新后恢复计数一致并清空盲区', () => {
+  const h = harness(); h.api.applyConfig({requiredKeywords:'AA'});
+  h.api.state.lastReadableRows = 1;
+  h.api.assessRosterCoverage(100_000, 3);
+  assert.equal(h.api.assessRosterCoverage(106_000, 3), 'blind');
+  h.api.state.lastReadableRows = 3;
+  assert.equal(h.api.assessRosterCoverage(107_000, 3), 'count-consistent');
+  assert.equal(h.api.state.coverageMismatchSince, 0);
+  assert.equal(h.api.state.lastCompleteCoverageAt, 107_000);
+});
+
+test('Claude 覆盖判据：无人数提示时未知，禁止假称覆盖完整', () => {
+  const h = harness(); h.api.applyConfig({requiredKeywords:'AA'});
+  h.api.state.lastReadableRows = 1;
+  assert.equal(h.api.assessRosterCoverage(100_000, null), 'unknown');
+  assert.equal(h.api.state.lastCompleteCoverageAt, 0);
+});
+
+test('Claude 覆盖判据：有完整滚动扫描时不能因虚拟列表少行直接判盲', () => {
+  const h = harness(); h.api.applyConfig({requiredKeywords:'AA'});
+  h.api.state.lastReadableRows = 5;
+  h.api.state.coverage = '20/20'; h.api.state.incomplete = false;
+  h.api.state.lastSweepAt = 99_000; h.api.state.lastSweepCount = 20;
+  assert.equal(h.api.assessRosterCoverage(100_000, 20), 'count-consistent');
+});
+
+test('Claude 覆盖判据：功能已暂停不误报 blind', () => {
+  const h = harness(); h.api.applyConfig({enabled:false,requiredKeywords:'AA'});
+  h.api.state.lastReadableRows = 1;
+  assert.equal(h.api.assessRosterCoverage(100_000, 3), 'inactive');
+});
+
+test('Claude 刷新历史：记录每一次真实失败，并被限流保护不覆盖', async () => {
+  const f = hiddenRosterFixture({noToggle:true});
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.h.api.state.rosterRefreshLog.length, 1);
+  assert.equal(f.h.api.state.rosterRefreshLog[0].outcome, 'close-not-confirmed');
+  f.h.api.state.rosterRefreshAttempts = 3;
+  f.h.api.state.lastRosterRefreshAt = Date.now() - 200_000;
+  assert.equal(await f.h.api.maybeRefreshHiddenRoster(), false);
+  assert.equal(f.h.api.state.rosterRefreshThrottle, 'rate-limited');
+  assert.equal(f.h.api.state.rosterRefreshResult, 'close-not-confirmed');
+  assert.equal(f.h.api.state.rosterRefreshLog.length, 1);
+  assert.doesNotMatch(JSON.stringify(f.h.api.healthSnapshot()), /AA张三|jdka laa|abc-defg-hij/);
+});
+
+test('Claude rAF 心跳：未启动浏览器帧心跳不得被错误认定为 alive', () => {
+  const h = harness(); h.api.applyConfig({requiredKeywords:'AA'});
+  const snap = h.api.healthSnapshot();
+  assert.equal(snap.renderAlive, null);
+  assert.equal(snap.renderFrameCount, 0);
+  assert.equal(snap.autoHiddenRosterToggle, false);
+});
+
+
+test('Claude 健康 PING 采用即时名单行，而不是沿用旧的绿色巡检计数', () => {
+  const f = hiddenRosterFixture({count:3});
+  f.h.api.state.lastReadableRows = 3; // 旧缓存误以为人员全部可读
+  const snap = f.h.api.healthSnapshot();
+  assert.equal(snap.rawRows, 1);
+  assert.equal(snap.readableRows, 1);
+  assert.equal(snap.participantCountHint, 3);
+  assert.equal(snap.coverageStatus, 'mismatch-pending');
+  f.h.api.state.coverageMismatchSince = Date.now()-6_000;
+  assert.equal(f.h.api.healthSnapshot().coverageStatus, 'blind');
+});
+
+test('Claude 渲染心跳只使用原生 rAF 记录帧，不替换 Meet API', () => {
+  const h = harness();
+  let pending=null, scheduled=0;
+  h.context.requestAnimationFrame = (cb) => { scheduled++; pending=cb; return scheduled; };
+  h.api.startRenderHeartbeat();
+  assert.equal(scheduled, 1);
+  pending(); pending();
+  const snap = h.api.healthSnapshot();
+  assert.equal(snap.renderFrameCount, 2);
+  assert.equal(snap.renderAlive, true);
+  assert.equal(scheduled, 3);
+  assert.equal(typeof h.context.window.requestAnimationFrame, 'undefined', '不能污染 Meet window 的 rAF');
+});
+
+
+test('长期隐藏后旧的虚拟列表扫描记录不能再宣称覆盖完整', () => {
+  const h = harness(); h.api.applyConfig({requiredKeywords:'AA'});
+  h.api.state.lastReadableRows = 2;
+  h.api.state.coverage = '20/20'; h.api.state.incomplete = false;
+  h.api.state.lastSweepAt = 100_000; h.api.state.lastSweepCount = 20;
+  assert.equal(h.api.assessRosterCoverage(170_001,20), 'mismatch-pending');
+  assert.equal(h.api.assessRosterCoverage(175_002,20), 'blind');
+});
+
+test('同人数但扫描人数不匹配的历史记录不能作为完整名单证据', () => {
+  const h = harness(); h.api.applyConfig({requiredKeywords:'AA'});
+  h.api.state.lastReadableRows = 2;
+  h.api.state.coverage = '20/20'; h.api.state.incomplete = false;
+  h.api.state.lastSweepAt = 100_000; h.api.state.lastSweepCount = 19;
+  assert.equal(h.api.assessRosterCoverage(101_000,20), 'mismatch-pending');
+});
+
+test('后台违规姓名首次出现时额外安排一次稳定复核，不能直接移出', async () => {
+  const h = harness();h.api.applyConfig({requiredKeywords:'AA'});
+  h.document.hidden = true;
+  h.api.rows([{key:'name-guest',name:'bad-guest',nameN:'bad-guest',isSelf:false,isHost:false,isPresentation:false,moreBtn:null}]);
+  h.api.scheduleHarvest();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.api.state.lastKickStage,'none');
+  assert.ok(h.api.state.suspectReviewTimer > 0);
+  assert.equal(h.timers.filter(x=>x.delay >= 20 && x.delay <= 1400).length,1);
+  // 多次变更不允许重复排队第二个延迟复核。
+  h.api.scheduleHarvest();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.timers.filter(x=>x.delay >= 20 && x.delay <= 1400).length,1);
+  h.api.shutdown('test-end');
+  assert.equal(h.api.state.suspectReviewTimer,0);
+});
+
+// 安全回归：只有本扩展的非标签页上下文可以请求健康/唤醒。
+test('巡检健康通道拒绝其他扩展、缺失来源与伪造 tab 来源', () => {
+  const h = harness();
+  const listener = h.messageListeners[0];
+  let replies = 0;
+  const respond = () => { replies++; };
+  for (const sender of [{}, {id:'other'}, {id:'test',tab:{id:999}}]) {
+    assert.equal(listener({protocol:'MNS_HEALTH_V1',action:'WAKE'},sender,respond),false);
+    assert.equal(listener({protocol:'MNS_HEALTH_V1',action:'PING'},sender,respond),false);
+  }
+  assert.equal(replies,0);
 });

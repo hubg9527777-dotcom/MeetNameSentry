@@ -23,7 +23,10 @@
   .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; }
   .row + .row { border-top: 1px solid var(--line); }
   .row b { display: block; font-weight: 600; }
-  .row small { color: var(--muted); font-size: 12px; }
+  .row small { display: block; color: var(--muted); font-size: 12px; }
+  .row #rafStatus { margin-top: 2px; }
+  .row #rafStatus.error { color: var(--err); }
+  .row #rafStatus.warning { color: var(--warn); }
 
   .switch { position: relative; flex: none; width: 36px; height: 20px; }
   .switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
@@ -62,10 +65,16 @@
       <label class="switch"><input type="checkbox" id="enabled" /><span></span></label>
     </div>
     <div class="row">
+      <div><b>后台名单辅助</b><small>隐藏 Meet 时继续帮助更新人员名单，不会自动弹出会议画面。</small><small>同时运行多个会议时，可能略增电脑负载。</small><small id="rafStatus" role="status" aria-live="polite">正在检查…</small></div>
+      <label class="switch" aria-label="后台名单辅助"><input type="checkbox" id="rafEnabled" aria-label="后台名单辅助" disabled /><span></span></label>
+    </div>
+    <div class="row">
       <div><b>试运行</b><small>只提示不合规的人，不真正移出</small></div>
       <label class="switch"><input type="checkbox" id="dryRun" /><span></span></label>
     </div>
   </section>
+
+
 
   <div class="fields">
     <label>名字必须包含
