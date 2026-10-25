@@ -1,12 +1,14 @@
 /*
- * MeetNameSentry v1.0.2 — 后台名单辅助的 rAF 调度桥。
+ * MeetNameSentry v1.0.3 — 后台名单辅助的 rAF 调度桥。
  * MAIN world, document_start; 不伪造可见性、不修改名单、不点击、不读取姓名。
  * 目的：在 Meet 隐藏时为页面待处理 rAF 回调提供低频后备调度，帮助名单更新。
  * 注意：定时器不能强迫 Chrome 的合成器生成真实帧，不能保证后台可用。
  */
 (() => {
   'use strict';
-  if (!/^\/[a-z]{3}-[a-z]{4}-[a-z]{3}\/?$/i.test(location.pathname)) return;
+  // 与 background.js 的 isMeetRoom 同步：支持带四字符前缀的 Meet 会议路由。
+  // MAIN world 不能依赖扩展隔离世界状态；此处再次只按 pathname 判断。
+  if (!/^\/(?:[a-z0-9]{4}\/)?[a-z]{3}-[a-z]{4}-[a-z]{3}\/?$/i.test(location.pathname)) return;
   const KEY = '__MNS_RAF_ISOLATED_EXP_V102__';
   if (window[KEY]?.active) return;
 
@@ -113,6 +115,10 @@
     status() {
       return {
         active, hidden: document.hidden,
+        // active 仅表示内部实例尚未停止；页面若重新覆盖原生函数，桥会失去接管。
+        // 每次读取时真实核对，避免将失效桥误报为正常。
+        hookInstalled: active && window.requestAnimationFrame === wrappedRAF &&
+          window.cancelAnimationFrame === wrappedCAF,
         startedAt, nativeDelivered, fallbackDelivered, lastNativeAt, lastFallbackAt,
         pendingCallbacks: pending.size, fallbackDelayMs: HIDDEN_FALLBACK_MS,
         visibilitySpoofed: false,

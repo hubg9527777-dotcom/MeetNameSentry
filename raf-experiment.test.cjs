@@ -42,6 +42,28 @@ test('实验 MAIN world 脚本仅对标准 Meet 房间生效，不碰首页', ()
   assert.equal(h.window.requestAnimationFrame,h.nativeRAF);
 });
 
+test('带四字符前缀的 Meet 会议在 MAIN world 能启动并执行隐藏帧回退', () => {
+  for (const pathname of ['/abcd/abc-defg-hij','/A9Z0/abc-defg-hij/']) {
+    const h=bridgeHarness({hidden:true,pathname});
+    assert.ok(h.controller,pathname);
+    assert.equal(h.controller.status().hookInstalled,true,pathname);
+    let calls=0;
+    h.window.requestAnimationFrame(()=>calls++);
+    h.triggerTimer();
+    assert.equal(calls,1,pathname);
+    assert.equal(h.controller.status().fallbackDelivered,1,pathname);
+  }
+});
+
+test('不把非会议或有额外层级的 Meet 页面改写 rAF', () => {
+  for (const pathname of ['/','/lookup/abc-defg-hij','/abc/abc-defg-hij',
+    '/abcde/abc-defg-hij','/abcd/abc-defg-hij/extra','/abcd/foo-bar']) {
+    const h=bridgeHarness({pathname});
+    assert.equal(h.controller,undefined,pathname);
+    assert.equal(h.window.requestAnimationFrame,h.nativeRAF,pathname);
+  }
+});
+
 test('MAIN world 无法安装全部 Hook 时立即回滚，且不得报告 active', () => {
   const h=bridgeHarness({blockedRAF:true});
   assert.equal(h.window.requestAnimationFrame,h.nativeRAF);
@@ -61,6 +83,17 @@ test('不同会议文档的 rAF 桥互相隔离，停止一处不会影响另一
   assert.equal(b.controller.active,true);
   b.triggerTimer();
   assert.equal(b.controller.status().fallbackDelivered,1);
+});
+
+test('桥接状态必须核对原生接口是否仍被接管，不能只相信 active', () => {
+  const h=bridgeHarness();
+  assert.equal(h.controller.status().hookInstalled,true);
+  const originalWrapped=h.window.requestAnimationFrame;
+  h.window.requestAnimationFrame=()=>123;
+  assert.equal(h.controller.active,true);
+  assert.equal(h.controller.status().hookInstalled,false);
+  h.window.requestAnimationFrame=originalWrapped;
+  assert.equal(h.controller.status().hookInstalled,true);
 });
 
 test('前台仍走真实 rAF，不产生额外定时器', () => {
@@ -161,10 +194,10 @@ test('反复装载相同桥脚本不能重复包装', () => {
   assert.equal(h.window.requestAnimationFrame,first);
 });
 
-function backgroundHarness({failStorage=false,failRegistration=false,failMainInjection=false,storageSeed={}} = {}) {
-  const registered=new Map(), bridgeActive=new Map(), state={...storageSeed}, calls=[], listeners={};
+function backgroundHarness({failStorage=false,failRegistration=false,failMainInjection=false,storageSeed={}, tabUrl='https://meet.google.com/abc-defg-hij'} = {}) {
+  const registered=new Map(), bridgeActive=new Map(), bridgeHooked=new Map(), state={...storageSeed}, calls=[], listeners={};
   const event=(name)=>({addListener:(fn)=>{listeners[name]=fn;}});
-  const tab={id:8,url:'https://meet.google.com/abc-defg-hij',status:'complete'};
+  const tab={id:8,url:tabUrl,status:'complete'};
   const chrome={
     runtime:{id:'mns-test',getURL:(f)=>`chrome-extension://mns-test/${f}`,onInstalled:event('installed'),onStartup:event('startup'),onMessage:event('message')},
     action:{setBadgeText: async()=>{}},
@@ -180,15 +213,17 @@ function backgroundHarness({failStorage=false,failRegistration=false,failMainInj
         if (opts.files?.includes('mns-raf-experiment-main.js')) {
           if (failMainInjection) throw new Error('mock-main-injection-failed');
           bridgeActive.set(tabId,true);
+          bridgeHooked.set(tabId,true);
           return [];
         }
         if (opts.func?.toString().includes('?.stop?.()')) {
           bridgeActive.set(tabId,false);
+          bridgeHooked.set(tabId,false);
           return [{result:true}];
         }
         if (opts.func?.toString().includes('const bridge = window.__MNS_RAF_ISOLATED_EXP_V102__')) {
           const active=bridgeActive.get(tabId)===true;
-          return [{result:{present:active,active}}];
+          return [{result:{present:active,active,hookInstalled:active && bridgeHooked.get(tabId)!==false}}];
         }
         return [];
       },
@@ -200,7 +235,7 @@ function backgroundHarness({failStorage=false,failRegistration=false,failMainInj
   };
   const context=vm.createContext({chrome,URL,Promise,Date,Map,setTimeout,clearTimeout,console:{warn(){}}});
   vm.runInContext(bgSource+'\nglobalThis.rafAPI={setRafExperiment,rafExperimentStatus,reconcileRafExperiment};',context);
-  return {api:context.rafAPI, registered, bridgeActive, state, calls, listeners,chrome};
+  return {api:context.rafAPI, registered, bridgeActive, bridgeHooked, state, calls, listeners,chrome};
 }
 
 test('首次安装默认开启并自动注册 MAIN world，不增加权限',async()=>{
@@ -213,8 +248,29 @@ test('首次安装默认开启并自动注册 MAIN world，不增加权限',asyn
   // 未写入过开关，也应按首次安装默认开启；注册不会被误认为用户明确选择。
   assert.equal(h.state.mnsRafExperimentEnabled,undefined);
   const manifest=JSON.parse(fs.readFileSync(path.join(__dirname,'manifest.json')));
-  assert.equal(manifest.version,'1.0.2');
+  assert.equal(manifest.version,'1.0.3');
   assert.deepEqual(manifest.permissions,['storage','scripting','alarms']);
+});
+
+test('双层会议网址：默认开启的 Worker 自检能实际找到并补注入 MAIN world 桥', async()=>{
+  const h=backgroundHarness({tabUrl:'https://meet.google.com/abcd/abc-defg-hij'});
+  const status=await h.api.rafExperimentStatus();
+  assert.equal(status.enabled,true);
+  assert.equal(status.registered,true);
+  assert.equal(status.rooms.checked,1);
+  assert.equal(status.rooms.active,1);
+  assert.equal(h.bridgeActive.get(8),true);
+  assert.equal(h.calls.filter(x=>x.files?.includes('mns-raf-experiment-main.js')).length,1);
+});
+
+test('双层会议网址：关闭后台辅助后不得补注入', async()=>{
+  const h=backgroundHarness({tabUrl:'https://meet.google.com/abcd/abc-defg-hij',
+    storageSeed:{mnsRafExperimentEnabled:false}});
+  const status=await h.api.rafExperimentStatus();
+  assert.equal(status.enabled,false);
+  assert.equal(status.registered,false);
+  assert.equal(status.rooms,null);
+  assert.equal(h.calls.filter(x=>x.files?.includes('mns-raf-experiment-main.js')).length,0);
 });
 
 test('手动开启时注册 document_start，且为已经打开的 Meet 立即补 MAIN world 注入',async()=>{
@@ -386,4 +442,57 @@ test('明确关闭的设置在 Worker 恢复时会停止遗留的 MAIN world 桥
   await h.api.reconcileRafExperiment();
   assert.equal(h.bridgeActive.get(8),false);
   assert.equal(h.registered.size,0);
+});
+
+test('页面后来覆盖了 rAF 接口时不得把仅 active=true 的桥误报为正常', async () => {
+  const h=backgroundHarness();
+  await h.api.setRafExperiment(true);
+  h.bridgeHooked.set(8,false); // 模拟第三方页面重新覆盖 rAF
+  const previousInject=h.calls.filter(x=>x.files?.includes('mns-raf-experiment-main.js')).length;
+  const status=await h.api.rafExperimentStatus();
+  assert.equal(status.rooms.checked,1);
+  assert.equal(status.rooms.active,0);
+  assert.equal(status.rooms.failed,1);
+  await h.api.reconcileRafExperiment();
+  assert.equal(h.calls.filter(x=>x.files?.includes('mns-raf-experiment-main.js')).length,previousInject,
+    '原因未明时不能盲目覆盖 Meet 自己后来安装的 rAF');
+});
+
+// 安全审查回归：页面若在桥启动后改写了 rAF，关闭插件时不能遗留旧桥定时器，
+// 也绝不能用旧的 rAF 覆盖 Google Meet 后来安装的新函数。
+test('后台辅助关闭时清理已失去 rAF 接管的旧桥，不覆盖页面新 Hook', async () => {
+  const h = backgroundHarness();
+  await h.api.setRafExperiment(true);
+  h.bridgeHooked.set(8, false);
+  const result = await h.api.setRafExperiment(false);
+  assert.equal(result.enabled, false);
+  assert.equal(h.bridgeActive.get(8), false, '失去接管的旧实例也必须收到 STOP');
+  assert.equal(h.state.mnsRafExperimentEnabled, false);
+});
+
+test('MAIN World 在页面覆盖 rAF 后停止：释放后备计时器但不覆盖页面函数', () => {
+  const h = bridgeHarness({hidden: true});
+  let invoked = 0;
+  h.window.requestAnimationFrame(() => invoked++);
+  assert.equal(h.timers.size, 1);
+  const meetOverrideRAF = () => 456;
+  h.window.requestAnimationFrame = meetOverrideRAF;
+  assert.equal(h.controller.status().hookInstalled, false);
+  assert.equal(h.controller.stop(), true);
+  assert.equal(h.window.requestAnimationFrame, meetOverrideRAF,
+    '不能覆盖 Meet 后来安装的 rAF');
+  assert.equal(h.window.cancelAnimationFrame, h.nativeCAF);
+  assert.equal(h.timers.size, 0, '隐藏帧计时器已全部清理');
+  assert.equal(h.listeners.size, 0, 'visibilitychange 监听器已卸载');
+  assert.equal(invoked, 0, '停用过程中不在后台直接执行旧回调');
+  assert.equal(h.nativeQueue.size, 1, '待处理回调安全交回原生调度');
+});
+
+test('后台监护重启时会清理用户已关闭且 Hook 已被覆盖的残留桥', async () => {
+  const h = backgroundHarness({storageSeed: {mnsRafExperimentEnabled: false}});
+  h.bridgeActive.set(8, true);
+  h.bridgeHooked.set(8, false);
+  await h.api.reconcileRafExperiment();
+  assert.equal(h.bridgeActive.get(8), false);
+  assert.equal(h.registered.size, 0);
 });

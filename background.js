@@ -1,5 +1,5 @@
 /**
- * MeetNameSentry v1.0.2 — 独立后台健康监护 (Chrome MV3 Service Worker)
+ * MeetNameSentry v1.0.3 — 独立后台健康监护 (Chrome MV3 Service Worker)
  * 职责只有：检查 Meet 页面是否已挂载巡检脚本、缺失时补注入、健康实例超时未轮询时唤醒。
  * 不访问参会者名单/姓名，不请求跨网站权限，不直接执行任何移出操作。
  */
@@ -68,13 +68,16 @@ async function rafBridgeInTab(tab, injectIfMissing) {
         world: 'MAIN',
         func: () => {
           const bridge = window.__MNS_RAF_ISOLATED_EXP_V102__;
-          return {present: !!bridge, active: bridge?.active === true};
+          return {present: !!bridge, active: bridge?.active === true,
+            hookInstalled: bridge?.status?.().hookInstalled === true};
         },
       });
       return results?.[0]?.result || {present:false,active:false};
     };
     const current = await inspect();
-    if (current.active) return 'active';
+    // 某些页面脚本可能在桥启用后覆盖 rAF。此时不能只看 active=true：
+    // 安全地报告失去接管，不擅自重复覆盖第三方页面函数。
+    if (current.active) return current.hookInstalled ? 'active' : 'hook-overridden';
     if (!injectIfMissing) return current.present ? 'inactive' : 'missing';
     await chrome.scripting.executeScript({
       target: {tabId: tab.id, allFrames: false},
@@ -82,7 +85,7 @@ async function rafBridgeInTab(tab, injectIfMissing) {
       files: [RAF_EXPERIMENT_FILE],
     });
     const repaired = await inspect();
-    return repaired.active ? 'injected' : 'not-activated';
+    return repaired.active && repaired.hookInstalled ? 'injected' : 'not-activated';
   } catch (error) {
     // 不输出具体 URL、页面内容或姓名；补注入失败不影响原来的巡检。
     return 'injection-failed';
@@ -95,7 +98,7 @@ async function inspectOpenRafRooms(injectIfMissing) {
   const results = await Promise.all(eligible.map((tab) => rafBridgeInTab(tab, injectIfMissing)));
   return {checked:eligible.length, active:results.filter((r)=>r==='active'||r==='injected').length,
     missing:results.filter((r)=>r==='missing'||r==='inactive').length,
-    failed:results.filter((r)=>r==='injection-failed'||r==='not-activated').length};
+    failed:results.filter((r)=>r==='injection-failed'||r==='not-activated'||r==='hook-overridden').length};
 }
 
 async function repairRafBridgeInOpenRooms() {
@@ -118,8 +121,10 @@ async function stopRafExperimentInOpenRooms() {
   try { tabs = await chrome.tabs.query({url: MEET_URL}); }
   catch { return; }
   await Promise.allSettled(tabs.filter((t) => isMeetRoom(t.url) && !isGoneOrFrozen(t)).map(async (tab) => {
-    // 没有桥接的页面无需注入任何控制代码；已有活动实例才恢复原生 rAF。
-    if (await rafBridgeInTab(tab, false) !== 'active') return;
+    // 页面可能后来覆盖 rAF：即使 Hook 已失去接管，旧桥仍可能保留挂起回调。
+    // 关闭时必须同样停止该实例；其 stop() 只恢复仍指向本桥的 API，不覆盖 Meet 新 Hook。
+    const bridgeState = await rafBridgeInTab(tab, false);
+    if (bridgeState !== 'active' && bridgeState !== 'hook-overridden') return;
     await chrome.scripting.executeScript({
       target: {tabId:tab.id,allFrames:false}, world: 'MAIN',
       func: () => window.__MNS_RAF_ISOLATED_EXP_V102__?.stop?.(),
@@ -184,11 +189,13 @@ async function reconcileRafExperiment() {
 const inFlight = new Map();
 const recentInjection = new Map();
 
+// 支持标准 /abc-defg-hij 和经验证的四字符前缀 /xxxx/abc-defg-hij。
+// 严格锚定会议码与站点，不能把主页或 /lookup 等普通路由误判成会议。
 function isMeetRoom(url) {
   try {
     const u = new URL(url);
     return u.protocol === 'https:' && u.hostname === 'meet.google.com' &&
-      /^\/[a-z]{3}-[a-z]{4}-[a-z]{3}\/?$/i.test(u.pathname);
+      /^\/(?:[a-z0-9]{4}\/)?[a-z]{3}-[a-z]{4}-[a-z]{3}\/?$/i.test(u.pathname);
   } catch { return false; }
 }
 

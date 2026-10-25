@@ -17,6 +17,7 @@
     font: 13px/1.5 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif; }
   header { padding: 14px 16px 10px; }
   h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: .01em; }
+  .version { font-size: 11px; font-weight: 400; color: var(--muted); }
   header p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
 
   .switches { margin: 0 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
@@ -55,7 +56,7 @@
 </head>
 <body>
   <header>
-    <h1>MeetNameSentry</h1>
+    <h1>MeetNameSentry <span class="version">v1.0.3</span></h1>
     <p>名字不含指定关键词的参会者会被移出会议（需主持人权限）。</p>
   </header>
 
@@ -79,7 +80,7 @@
   <div class="fields">
     <label>名字必须包含
       <input type="text" id="requiredKeywords" placeholder="例如：AA，BB" autocomplete="off" />
-      <small>多个关键词用逗号分隔，满足任意一个即合规。AA张三、王五AA、AA-张三可通过；jdka laa、AAlice、AA123、张AA三、只有AA均不通过。必需关键词须在姓名前或后，且必须有实际姓名文字。忽略大小写及全半角；留空不移出。</small>
+      <small>多个关键词用逗号分隔，满足任意一个即合规。AA张三、王五AA、AA-张三可通过；jdka laa、AAlice、AA123、张AA三、只有AA均不通过。必需关键词须在姓名前或后；含中文的姓名至少两个汉字（AA张不通过、AA张三通过）。忽略大小写及全半角；留空不移出。</small>
     </label>
     <label>关键词白名单
       <input type="text" id="keywordWhitelist" placeholder="例如：助教，TA" autocomplete="off" />

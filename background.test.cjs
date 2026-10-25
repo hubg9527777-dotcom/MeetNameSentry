@@ -49,9 +49,12 @@ function harness({tabs = [room()], onMessage, onInject, onBadge} = {}) {
 
 test('严格匹配 Meet 会议链接，不注入首页、其他域名、相似主机及外站', () => {
   const h = harness();
-  for (const url of ['https://meet.google.com/abc-defg-hij', 'https://meet.google.com/abc-defg-hij/?authuser=0'])
+  for (const url of ['https://meet.google.com/abc-defg-hij', 'https://meet.google.com/abc-defg-hij/?authuser=0',
+    'https://meet.google.com/abcd/abc-defg-hij', 'https://meet.google.com/A9Z0/abc-defg-hij/?authuser=1'])
     assert.equal(h.api.isMeetRoom(url), true, url);
   for (const url of ['https://meet.google.com/', 'https://meet.google.com/landing', 'https://meet.google.com/lookup/abc',
+    'https://meet.google.com/abc/abc-defg-hij', 'https://meet.google.com/abcde/abc-defg-hij',
+    'https://meet.google.com/abcd/abc-defg-hij/extra', 'https://meet.google.com/abcd/not-a-meeting',
     'https://evil-meet.google.com/abc-defg-hij', 'http://meet.google.com/abc-defg-hij',
     'https://meet.google.com.evil.example/abc-defg-hij', 'about:blank', ''])
     assert.equal(h.api.isMeetRoom(url), false, url);
@@ -66,6 +69,20 @@ test('当前 Meet 没有内容脚本时安全补注入一次（仅主框架、�
   assert.equal(world, 'ISOLATED');
   assert.equal(target.tabId, 5);
   assert.equal(target.allFrames, false);
+});
+
+test('双层会议路径也能触发内容巡检脚本的缺失恢复', async () => {
+  const h = harness({tabs:[room(42, 'https://meet.google.com/abcd/abc-defg-hij')]});
+  assert.equal(await h.api.ensureHealth(h.tabs[0]), 'injected');
+  assert.equal(h.injections.length,1);
+  assert.equal(h.injections[0].target.tabId,42);
+  assert.deepEqual(Array.from(h.injections[0].files), ['content.js']);
+});
+
+test('多层非会议网址禁止执行巡检或注入', async () => {
+  const h = harness({tabs:[room(42,'https://meet.google.com/lookup/abc-defg-hij')]});
+  assert.equal(await h.api.ensureHealth(h.tabs[0]), 'skipped');
+  assert.equal(h.injections.length,0);
 });
 
 test('没有监听器且频繁触发时冷却去重，不会无限补注入', async () => {
@@ -167,7 +184,7 @@ test('启动时建立周期唤醒 alarm，不能依赖 Service Worker setInterva
 
 test('清单限制权限，并配置后台 Worker', () => {
   const m = JSON.parse(fs.readFileSync(path.join(__dirname,'manifest.json'),'utf8'));
-  assert.equal(m.version,'1.0.2');
+  assert.equal(m.version,'1.0.3');
   assert.deepEqual(m.permissions,['storage','scripting','alarms']);
   assert.deepEqual(m.host_permissions,['https://meet.google.com/*']);
   assert.equal(m.background.service_worker, 'background.js');

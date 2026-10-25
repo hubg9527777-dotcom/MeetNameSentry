@@ -169,6 +169,9 @@ if (rafToggle && rafStatus) {
     rafKnown = true;
     if (reply.registered !== lastRafEnabled) {
       showRafStatus('状态同步中，请重新打开设置查看', 'warning');
+    } else if (lastRafEnabled && reply.rooms?.checked > 0 &&
+               (reply.rooms.failed > 0 || reply.rooms.missing > 0)) {
+      showRafStatus('已开启，但有会议未正常运行。请先刷新 Meet。', 'warning');
     } else {
       showRafStatus(lastRafEnabled ? '已开启（默认开启）' : '已关闭');
     }

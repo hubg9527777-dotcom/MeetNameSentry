@@ -124,6 +124,27 @@ test('AA 作为独立标记允许通过，可用空格、括号、横线或表�
   }
 });
 
+test('必需关键词旁只有一个汉字时不放行，两字以上放行；英文名字保持原规则', () => {
+  const h = harness();
+  h.api.applyConfig({ requiredKeywords: 'AA' });
+  for (const name of ['AA张','张AA','AA-张','张-AA','AA 张','张 AA','AA+张','张+AA',
+    '[AA]张','张(AA)','AA🌸张','🌸AA张','ＡＡ张','张ａａ','AA张John','李AA']) {
+    assert.equal(h.api.evaluate({nameN:h.api.norm(name)}).ok,false,name);
+  }
+  for (const name of ['AA张三','王小明AA','AA-张三','张三+AA','AA 张三','张三 AA',
+    'AA-John','John-AA','AA Maria','Maria AA','AA+Ana']) {
+    assert.equal(h.api.evaluate({nameN:h.api.norm(name)}).ok,true,name);
+  }
+});
+
+test('两个汉字限制不影响用户明确指定的白名单豁免', () => {
+  const h = harness();
+  h.api.applyConfig({requiredKeywords:'AA', exactWhitelist:'AA张',keywordWhitelist:'TA'});
+  assert.equal(h.api.evaluate({nameN:h.api.norm('AA张')}).ok,true);
+  assert.equal(h.api.evaluate({nameN:h.api.norm('TA 张')}).ok,true);
+  assert.equal(h.api.evaluate({nameN:h.api.norm('AA李')}).ok,false);
+});
+
 test('阻止拼写尾部包含 aa 的英文词误放行：jdka laa', () => {
   const h = harness();
   h.api.applyConfig({ requiredKeywords: 'AA' });
@@ -1108,15 +1129,15 @@ test('西语/葡语/法语/意语等批量移出不能命中单人移出或确�
   assert.ok(h.api.findConfirmButton(element('', [element('Remove')])), '单人确认继续可用');
 });
 
-test('发布版本及运行时标识统一为 1.0.2', () => {
+test('发布版本及运行时标识统一为 1.0.3', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8'));
   const content = fs.readFileSync(path.join(__dirname, 'content.js'), 'utf8');
-  assert.equal(manifest.version, '1.0.2');
-  assert.match(content, /content\.js \(v1\.0\.2\)/);
-  assert.match(content, /巡检引擎已挂载 v1\.0\.2/);
+  assert.equal(manifest.version, '1.0.3');
+  assert.match(content, /content\.js \(v1\.0\.3\)/);
+  assert.match(content, /巡检引擎已挂载 v1\.0\.3/);
 });
 
-// v1.0.2 完整安全复审：异步存储结果只能更新它对应的最新字段状态。
+// v1.0.3 完整安全复审：异步存储结果只能更新它对应的最新字段状态。
 function popupRaceHarness() {
   const handlers = new Map();
   const fields = Object.fromEntries(['status', 'size', 'enabled', 'dryRun',
@@ -1184,7 +1205,7 @@ test('文本新输入等待防抖时，旧保存回调不可提前显示已保�
   assert.match(h.fields.status.textContent, /已保存/);
 });
 
-// v1.0.2 运行状态自检 / 安全恢复：与实际姓名匹配和移出流程独立。
+// v1.0.3 运行状态自检 / 安全恢复：与实际姓名匹配和移出流程独立。
 test('失去巡检调度且没有正在处置的任务时，看门狗唤醒周期', async () => {
   const h = harness();
   h.api.applyConfig({});
@@ -1261,7 +1282,7 @@ test('后台状态请求不会暴露姓名，也不会自动执行踢人', () =>
   const sync = h.messageListeners[0]({ protocol: 'MNS_HEALTH_V1', action: 'PING' }, {id:'test'}, (p) => { payload = p; });
   assert.equal(sync, false);
   assert.equal(payload.protocol, 'MNS_HEALTH_V1');
-  assert.equal(payload.version, '1.0.2');
+  assert.equal(payload.version, '1.0.3');
   assert.equal(payload.alive, true);
   assert.equal(payload.configReady, false);
   assert.equal(payload.enabled, false);

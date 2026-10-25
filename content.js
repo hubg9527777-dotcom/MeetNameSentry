@@ -1,5 +1,5 @@
 /**
- * MeetNameSentry — content.js (v1.0.2)
+ * MeetNameSentry — content.js (v1.0.3)
  * Google Meet 命名纪律守卫（只有主持人 / 联席主持人才真正有“移出”权限）
  *
  * 设计原则
@@ -189,6 +189,9 @@
   const LATIN_TOKEN_CHAR_RE = /[\p{Script=Latin}\p{Number}\p{Mark}]/u;
   const LETTER_RE = /\p{Letter}/u;
   const LETTER_OR_NUMBER_RE = /[\p{Letter}\p{Number}]/u;
+  // 必需关键词放行中文姓名时，去除关键词后必须至少两个汉字；英文姓名不受影响。
+  // 只作用于必需关键词，不覆盖明确设置的精确白名单或关键词白名单。
+  const HAN_CHARACTER_RE = /\p{Script=Han}/gu;
   const isLatinLikeMarker = (marker) => LATIN_TOKEN_CHAR_RE.test(firstCodePoint(marker)) ||
     LATIN_TOKEN_CHAR_RE.test(lastCodePoint(marker));
   // 返回完整的 Unicode 码点而不是 UTF-16 单个码元；避免补充平面字符破坏边界判断。
@@ -198,7 +201,7 @@
   /**
    * 英文标记不可嵌在更长的拉丁字母/数字中。
    * strictEdge=true：必需关键词只能位于姓名前缀或后缀，且除标记外必须确实有姓名文字：
-   *   AA张三、张三AA、[AA]张三、张三(AA) → 合规；张AA三、AA、AA--- → 不合规。
+   *   AA张三、张三AA、[AA]张三、张三(AA) → 合规；AA张、张AA、张AA三、AA、AA--- → 不合规。
    * 关键词白名单保留已有“词内独立标记”的用法，不强制前后缀。
    */
   function containsCompleteMarker(name, marker, strictEdge = false) {
@@ -218,7 +221,10 @@
       const edgeOk = !strictEdge ||
         (!LETTER_OR_NUMBER_RE.test(left) && LETTER_RE.test(right)) ||
         (!LETTER_OR_NUMBER_RE.test(right) && LETTER_RE.test(left));
-      if (tokenOk && edgeOk) return true;
+      // 用户规则：中文姓名最低两个汉字（AA张 / 张AA 不再放行）。
+      // 纯英文等无汉字姓名维持现有合规规则，避免意外阻断 AA-John。
+      const hanCount = strictEdge ? ((left + right).match(HAN_CHARACTER_RE)?.length || 0) : 0;
+      if (tokenOk && edgeOk && (!strictEdge || hanCount === 0 || hanCount >= 2)) return true;
       from = pos + 1;
     }
     return false;
@@ -1406,7 +1412,7 @@
     } catch { /* 诊断失败不影响生命体征回复，也不授权移出 */ }
     return {
       protocol: HEALTH_PROTOCOL,
-      version: '1.0.2',
+      version: '1.0.3',
       alive: alive(),
       configReady,
       enabled: configReady && cfg.enabled,
@@ -1507,7 +1513,7 @@
     state.rootObserver.observe(document.documentElement, { childList: true, subtree: true });
 
     wake();
-    console.info(LOG, '巡检引擎已挂载 v1.0.2');
+    console.info(LOG, '巡检引擎已挂载 v1.0.3');
   })().catch((err) => {
     console.error(LOG, '巡检引擎初始化异常：', safeErrorKind(err));
     try { hud.set('启动异常 · 正在等待监护恢复', C.err); } catch { /* DOM 暂不可用 */ }

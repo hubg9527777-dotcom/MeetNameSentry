@@ -11,7 +11,7 @@ const runtime = ['background.js','content.js','popup.js','mns-raf-experiment-mai
 
 test('Manifest 版本、主机权限与最小化扩展权限保持固定', () => {
   assert.equal(manifest.manifest_version,3);
-  assert.equal(manifest.version,'1.0.2');
+  assert.equal(manifest.version,'1.0.3');
   assert.deepEqual(manifest.permissions,['storage','scripting','alarms']);
   assert.deepEqual(manifest.host_permissions,['https://meet.google.com/*']);
   assert.equal(manifest.externally_connectable,undefined);
