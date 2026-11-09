@@ -20,3 +20,15 @@ coverage/
 *.tmp
 *.swp
 *.zip
+
+# Additional local auth/configuration material (not used by this extension).
+.npmrc
+.pypirc
+*.p8
+*.p12
+*.crt
+*.asc
+*.kdbx
+*.sqlite
+*.sqlite3
+*.db

@@ -184,7 +184,7 @@ test('启动时建立周期唤醒 alarm，不能依赖 Service Worker setInterva
 
 test('清单限制权限，并配置后台 Worker', () => {
   const m = JSON.parse(fs.readFileSync(path.join(__dirname,'manifest.json'),'utf8'));
-  assert.equal(m.version,'1.0.3');
+  assert.equal(m.version,'1.0.4');
   assert.deepEqual(m.permissions,['storage','scripting','alarms']);
   assert.deepEqual(m.host_permissions,['https://meet.google.com/*']);
   assert.equal(m.background.service_worker, 'background.js');

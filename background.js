@@ -1,5 +1,5 @@
 /**
- * MeetNameSentry v1.0.3 — 独立后台健康监护 (Chrome MV3 Service Worker)
+ * MeetNameSentry v1.0.4 — 独立后台健康监护 (Chrome MV3 Service Worker)
  * 职责只有：检查 Meet 页面是否已挂载巡检脚本、缺失时补注入、健康实例超时未轮询时唤醒。
  * 不访问参会者名单/姓名，不请求跨网站权限，不直接执行任何移出操作。
  */
@@ -355,12 +355,12 @@ if (chrome.runtime.onMessage?.addListener) chrome.runtime.onMessage.addListener(
   // 即使来自本扩展的内容脚本，也不能通过此管理协议操作后台 rAF 桥。
   const settingsURL = chrome.runtime.getURL?.('popup.html');
   if (msg?.protocol !== RAF_EXPERIMENT_PROTOCOL || !settingsURL ||
-      sender?.id !== chrome.runtime.id || sender?.url !== settingsURL ||
+      sender?.id !== chrome.runtime.id || sender?.url !== settingsURL || sender?.tab ||
       !['STATUS','ENABLE','DISABLE'].includes(msg.action)) return false;
   const action = msg.action === 'STATUS' ? rafExperimentStatus() :
     setRafExperiment(msg.action === 'ENABLE');
   action.then((data) => sendResponse({ok:true,...data}),
-    (error) => sendResponse({ok:false,error:error?.name || 'experiment-operation-failed'}));
+    (error) => sendResponse({ok:false,error:safeErrorKind(error)}));
   return true;
 });
 

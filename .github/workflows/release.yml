@@ -11,46 +11,63 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout pinned source
+      - name: Checkout source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Validate version and files
+
+      - name: Verify version
         run: |
           set -euo pipefail
-          VERSION=$(node -p "JSON.parse(require('fs').readFileSync('manifest.json','utf8')).version")
-          test "v${VERSION}" = "${GITHUB_REF_NAME}"
-          for file in manifest.json content.js background.js popup.html popup.js \
-            mns-raf-experiment-main.js icons/icon.svg icons/icon16.png \
-            icons/icon32.png icons/icon48.png icons/icon128.png; do
-            test -f "$file" || { echo "Missing $file"; exit 1; }
-          done
-          for file in content.js background.js popup.js mns-raf-experiment-main.js; do
-            node --check "$file"
-          done
-      - name: Run tests
+          VERSION=$(node -p "require('./manifest.json').version")
+          test "v$VERSION" = "$GITHUB_REF_NAME"
+
+      - name: Verify required files
         run: |
-          node --test security.test.cjs background.test.cjs \
-            popup-raf.test.cjs raf-experiment.test.cjs \
-            security-static-audit.test.cjs
-      - name: Package essential runtime files only
+          set -euo pipefail
+          for file in \
+            manifest.json content.js background.js \
+            popup.html popup.js mns-raf-experiment-main.js \
+            icons/icon.svg icons/icon16.png icons/icon32.png \
+            icons/icon48.png icons/icon128.png; do
+            test -f "$file"
+          done
+
+      - name: Check JavaScript
+        run: |
+          node --check content.js
+          node --check background.js
+          node --check popup.js
+          node --check mns-raf-experiment-main.js
+
+      - name: Run tests
+        run: node --test *.test.cjs
+
+      - name: Package extension
         run: |
           set -euo pipefail
           mkdir -p dist
+
           zip -q -X "dist/MeetNameSentry-${GITHUB_REF_NAME}.zip" \
-            manifest.json content.js background.js popup.html popup.js \
-            mns-raf-experiment-main.js icons/icon.svg icons/icon16.png \
-            icons/icon32.png icons/icon48.png icons/icon128.png
+            manifest.json \
+            content.js \
+            background.js \
+            popup.html \
+            popup.js \
+            mns-raf-experiment-main.js \
+            icons/icon.svg \
+            icons/icon16.png \
+            icons/icon32.png \
+            icons/icon48.png \
+            icons/icon128.png
+
           unzip -t "dist/MeetNameSentry-${GITHUB_REF_NAME}.zip"
+
       - name: Publish Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          set -euo pipefail
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" dist/*.zip --clobber
-          else
-            gh release create "${GITHUB_REF_NAME}" dist/*.zip \
-              --title "MeetNameSentry ${GITHUB_REF_NAME}" \
-              --notes '新增后台巡检与后台名单辅助；兼容双层 Google Meet 会议路径，改善隐藏会议中的名单检查，并要求中文姓名至少两个汉字。'
-          fi
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+            --title "MeetNameSentry $GITHUB_REF_NAME" \
+            --notes "优化后台名单辅助与静默巡检，改善启动时的弹窗误阻塞，并加强扩展安全性。保留原有姓名规则与自动移出功能。"

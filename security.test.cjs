@@ -52,6 +52,7 @@ function harness() {
       scheduleHarvest, maybeSweep, waitFor, healthCheck, healthSnapshot, wake, shutdown,
       assessRosterCoverage, startRenderHeartbeat,
       mockSweep: (fn) => { sweep = fn; },
+      mockWaitForQuiet: (fn) => { waitForQuiet = fn; },
       revision: () => configRevision, ready: () => configReady,
       rows: (rows) => { readRows = () => rows; },
       wait: (fn) => { waitFor = fn; },
@@ -62,6 +63,27 @@ function harness() {
   vm.runInContext(source, context);
   return { api: context.api, callbacks, context, document, logs, observers, timers, messageListeners };
 }
+
+test('关闭并重新开启巡检会清除旧失败窗口且不篡改在途保护状态', () => {
+  const h = harness();
+  h.api.applyConfig({enabled: true, requiredKeywords: 'AA'});
+  h.api.state.recentFails.push(Date.now() - 300, Date.now() - 200, Date.now() - 100);
+  h.api.state.pausedUntil = Date.now() + 120000;
+  h.api.state.pauseReason = '连续失败';
+  h.api.state.noRemoveStreak = 2;
+  h.api.state.busy = true;
+  h.api.applyConfig({enabled: false, requiredKeywords: 'AA'});
+  assert.equal(h.api.cfg.enabled, false);
+  assert.equal(h.api.state.recentFails.length, 0);
+  assert.equal(h.api.state.pausedUntil, 0);
+  assert.equal(h.api.state.pauseReason, '');
+  assert.equal(h.api.state.noRemoveStreak, 0);
+  assert.equal(h.api.state.busy, true); // 不并发开启第二个移出流程
+  h.api.state.recentFails.push(Date.now());
+  h.api.applyConfig({enabled: true, requiredKeywords: 'AA'});
+  assert.equal(h.api.state.recentFails.length, 0);
+  assert.equal(h.api.cfg.enabled, true);
+});
 
 test('配置读取失败时停止，不能退回默认自动移出', async () => {
   const h = harness();
@@ -267,6 +289,28 @@ test('额外移出文案只能完整匹配，歧义/隐藏/禁用项拒绝', () 
   assert.equal(h.api.findRemoveItem(element('', [hidden])), null);
 });
 
+
+test('仅 aria-label/title 含明确移出动作的无文本确认按钮可以识别，且仍只认唯一目标', () => {
+  const h = harness();
+  const aria = element('', [], {'aria-label': 'Remove'});
+  const titled = element('', [], {'title': '移出'});
+  assert.equal(h.api.findConfirmButton(element('', [element('Cancel'), aria])), aria);
+  assert.equal(h.api.findConfirmButton(element('', [element('取消'), titled])), titled);
+  assert.equal(h.api.findConfirmButton(element('', [aria, titled])), null);
+});
+
+test('多个名称来源存在举报、取消或批量行为时，禁止把按钮当作安全移出确认', () => {
+  const h = harness();
+  for (const bad of [
+    element('Remove', [], {'aria-label':'Report participant'}),
+    element('Remove', [], {'title':'Remove all'}),
+    element('', [], {'aria-label':'Remove', 'title':'举报'}),
+    element('', [], {'aria-label':'Remove and report'}),
+    element('', [], {'aria-label':'Cancel'}),
+    element('', [], {'aria-label':'Continue'}),
+  ]) assert.equal(h.api.findConfirmButton(element('', [element('Cancel'),bad])), null);
+});
+
 test('未知确认按钮、举报和多个破坏性按钮不能触发确认', () => {
   const h = harness();
   assert.equal(h.api.findConfirmButton(element('', [element('Cancel'), element('Continue')])), null);
@@ -322,6 +366,26 @@ for (const [label, change] of [
     assert.equal(f.clicks(), 0);
   });
 }
+
+test('确认按钮只有 aria-label 时，完整移出流程仍须通过逐次目标复核', async () => {
+  const h = harness(); h.api.applyConfig({dryRun:false});
+  let clicks=0;
+  const row=element(), moreBtn=element();
+  row.contains=(item)=>item===moreBtn;
+  const target={row,moreBtn,key:'p1',name:'PRIVATE-NAME',nameN:'private-name'};
+  const remove=element('Remove from call');
+  const menu=element('',[remove]);
+  const confirm=element('',[],{'aria-label':'Remove'});
+  const dialog=element('Remove PRIVATE-NAME?',[element('Cancel'),confirm]);
+  confirm.click=()=>{clicks++;dialog.isConnected=false;};
+  h.api.rows([target]);
+  h.api.menu(async()=>menu);
+  let step=0;
+  h.api.wait(async()=>++step===1?dialog:true);
+  await h.api.kick({...target});
+  assert.equal(clicks,1);
+  assert.equal(h.api.state.lastKickStage,'completed');
+});
 
 test('正常移出路径通过且控制台不含姓名', async () => {
   const h = harness(); h.api.applyConfig({ dryRun: false });
@@ -579,6 +643,65 @@ test('后台标签页允许需要的滚动扫描，而不是直接跳过', async
   h.api.mockSweep(async () => { count++; });
   await h.api.maybeSweep();
   assert.equal(count, 1);
+});
+
+test('前台可见时严禁主动滚动扫描，隐藏后仍允许后台扫描', async () => {
+  const h = harness();
+  h.api.applyConfig({ requiredKeywords: 'AA' });
+  const sc = element();
+  sc.scrollHeight = 1400;
+  sc.clientHeight = 300;
+  h.context.getComputedStyle = () => ({ visibility: 'visible', overflowY: 'auto' });
+  h.api.state.observedList = sc;
+  let calls = 0;
+  h.api.mockSweep(async () => { calls++; });
+  h.document.hidden = false;
+  await h.api.maybeSweep();
+  assert.equal(calls, 0, '用户正在观看的名单不得发生任何程序滚动');
+  h.document.hidden = true;
+  await h.api.maybeSweep();
+  assert.equal(calls, 1, '隐藏页面仍能执行后台名单覆盖扫描');
+});
+
+test('后台滚动扫描中用户切回前台立即停止并恢复原位置', async () => {
+  const h = harness();
+  h.document.hidden = true;
+  h.api.applyConfig({ requiredKeywords: 'AA' });
+  const sc = element();
+  sc.scrollHeight = 1400;
+  sc.clientHeight = 300;
+  sc.scrollTop = 170;
+  const moves = [];
+  sc.scrollTo = ({top}) => { moves.push(top); sc.scrollTop = top; };
+  h.context.getComputedStyle = () => ({ visibility: 'visible', overflowY: 'auto' });
+  h.api.state.observedList = sc;
+  h.api.mockWaitForQuiet(async () => { h.document.hidden = false; });
+  await h.api.maybeSweep();
+  assert.deepEqual(moves, [0, 170], '只允许隐藏时开始扫描和切回前台时恢复原位');
+  assert.equal(h.api.state.incomplete, true, '中断的扫描不能被记为完整覆盖');
+});
+
+test('后台扫描期间用户手动滚动时不得强行恢复位置覆盖用户操作', async () => {
+  const h = harness();
+  h.document.hidden = true;
+  h.api.applyConfig({ requiredKeywords: 'AA' });
+  const sc = element();
+  sc.scrollHeight = 1400;
+  sc.clientHeight = 300;
+  sc.scrollTop = 170;
+  const moves = [];
+  sc.scrollTo = ({top}) => { moves.push(top); sc.scrollTop = top; };
+  h.context.getComputedStyle = () => ({ visibility: 'visible', overflowY: 'auto' });
+  h.api.state.observedList = sc;
+  h.api.mockWaitForQuiet(async () => {
+    h.document.hidden = false;
+    h.api.state.lastInput = Date.now() + 1000;
+    sc.scrollTop = 79; // 用户手动改变的真实滚动位置
+  });
+  await h.api.maybeSweep();
+  assert.deepEqual(moves, [0], '不得在用户接手后继续滚动或强行恢复');
+  assert.equal(sc.scrollTop, 79);
+  assert.equal(h.api.state.incomplete, true);
 });
 
 test('隐藏标签页的 waitFor 在 DOM 变化时以微任务响应，不依赖延迟轮询', async () => {
@@ -1129,15 +1252,15 @@ test('西语/葡语/法语/意语等批量移出不能命中单人移出或确�
   assert.ok(h.api.findConfirmButton(element('', [element('Remove')])), '单人确认继续可用');
 });
 
-test('发布版本及运行时标识统一为 1.0.3', () => {
+test('发布版本及运行时标识统一为 1.0.4', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8'));
   const content = fs.readFileSync(path.join(__dirname, 'content.js'), 'utf8');
-  assert.equal(manifest.version, '1.0.3');
-  assert.match(content, /content\.js \(v1\.0\.3\)/);
-  assert.match(content, /巡检引擎已挂载 v1\.0\.3/);
+  assert.equal(manifest.version, '1.0.4');
+  assert.match(content, /content\.js \(v1\.0\.4\)/);
+  assert.match(content, /巡检引擎已挂载 v1\.0\.4/);
 });
 
-// v1.0.3 完整安全复审：异步存储结果只能更新它对应的最新字段状态。
+// v1.0.4 完整安全复审：异步存储结果只能更新它对应的最新字段状态。
 function popupRaceHarness() {
   const handlers = new Map();
   const fields = Object.fromEntries(['status', 'size', 'enabled', 'dryRun',
@@ -1205,7 +1328,7 @@ test('文本新输入等待防抖时，旧保存回调不可提前显示已保�
   assert.match(h.fields.status.textContent, /已保存/);
 });
 
-// v1.0.3 运行状态自检 / 安全恢复：与实际姓名匹配和移出流程独立。
+// v1.0.4 运行状态自检 / 安全恢复：与实际姓名匹配和移出流程独立。
 test('失去巡检调度且没有正在处置的任务时，看门狗唤醒周期', async () => {
   const h = harness();
   h.api.applyConfig({});
@@ -1282,7 +1405,7 @@ test('后台状态请求不会暴露姓名，也不会自动执行踢人', () =>
   const sync = h.messageListeners[0]({ protocol: 'MNS_HEALTH_V1', action: 'PING' }, {id:'test'}, (p) => { payload = p; });
   assert.equal(sync, false);
   assert.equal(payload.protocol, 'MNS_HEALTH_V1');
-  assert.equal(payload.version, '1.0.3');
+  assert.equal(payload.version, '1.0.4');
   assert.equal(payload.alive, true);
   assert.equal(payload.configReady, false);
   assert.equal(payload.enabled, false);
@@ -1353,6 +1476,58 @@ test('敏感移出确认、alertdialog、输入表单继续阻止自动点击人
   }
 });
 
+
+test('旧弹窗已明确隐藏或不在屏幕内时，不再永久卡住开面板', () => {
+  for (const mode of ['aria-hidden', 'inert', 'opacity', 'offscreen', 'hidden-parent']) {
+    const h = harness();
+    const overlay = element('Remove from call?', [], {role:'alertdialog'});
+    overlay.matches = (sel) => sel === '[role="alertdialog"]';
+    if (mode === 'aria-hidden' || mode === 'inert') {
+      const oldMatches = overlay.matches;
+      overlay.matches = (sel) => sel === '[aria-hidden="true"], [inert]' || oldMatches(sel);
+    }
+    if (mode === 'opacity') {
+      h.context.getComputedStyle = (el) => ({visibility:'visible', opacity:el === overlay ? '0':'1'});
+    }
+    if (mode === 'offscreen') {
+      h.context.window.innerWidth = 900;
+      h.context.window.innerHeight = 700;
+      overlay.getBoundingClientRect = () => ({left:1000,right:1200,top:50,bottom:150});
+    }
+    if (mode === 'hidden-parent') {
+      const ancestor = element('');
+      ancestor.matches = (sel) => sel === '[aria-hidden="true"], [inert]';
+      overlay.parentElement = ancestor;
+    }
+    assert.equal(h.api.blocksParticipantAutomation(overlay), false, mode);
+  }
+});
+
+test('启动时残留透明移出弹窗不再卡住参与者面板；可继续巡检', async () => {
+  const h = harness(), p = panelFixture(h);
+  const stale = element('Remove from call?', [], {role:'alertdialog'});
+  stale.matches = (sel) => sel === '[role="alertdialog"]';
+  h.context.getComputedStyle = (el) => ({visibility:'visible',opacity:el === stale ? '0':'1'});
+  const oldQuery = h.document.querySelectorAll;
+  h.document.querySelectorAll = (sel) => sel.includes('alertdialog') && sel.includes('aria-modal') ? [stale] : oldQuery(sel);
+  h.api.wait(async (probe) => {p.show(); return probe();});
+  assert.equal(h.api.hasBlockingOverlay(),false);
+  assert.equal(await h.api.ensurePeoplePanel(),true);
+  assert.equal(p.clicks(),1);
+});
+
+test('活动的移出弹窗、举报窗口和可编辑表单仍然阻止自动操作', () => {
+  const h = harness();
+  const confirm = element('Remove from call?', [], {role:'alertdialog'});
+  confirm.matches = (sel) => sel === '[role="alertdialog"]';
+  assert.equal(h.api.blocksParticipantAutomation(confirm), true);
+  const edit = element('设置', [], {role:'dialog'});
+  const input = element('');
+  input.readOnly = false;
+  input.getAttribute = () => null;
+  edit.querySelectorAll = (sel) => sel.includes('input') ? [input] : [];
+  assert.equal(h.api.blocksParticipantAutomation(edit), true);
+});
 
 test('健康快照区分循环存活与真正的名单巡检，不泄露姓名', () => {
   const h = harness(); h.api.applyConfig({dryRun:true});
@@ -1770,4 +1945,63 @@ test('巡检健康通道拒绝其他扩展、缺失来源与伪造 tab 来源', 
     assert.equal(listener({protocol:'MNS_HEALTH_V1',action:'PING'},sender,respond),false);
   }
   assert.equal(replies,0);
+});
+
+test('自适应音频系统状态不含独立参会者 ID 时不误当成待移出的人', () => {
+  const h = harness();
+  h.api.applyConfig({ requiredKeywords: 'AA' });
+  for (const name of ['合并的音频', '音频已合并', 'merged audio']) {
+    const row = element(name, [], { 'aria-label': name });
+    assert.equal(h.api.readRow(row, ''), null, name);
+  }
+  // 不能因为文本相似而把真正的用户加进豁免规则：明确存在参与者 ID 仍按姓名判定。
+  const realParticipant = h.api.readRow(element('合并的音频', [], {
+    'aria-label': '合并的音频', 'data-participant-id': 'genuine-user',
+  }), '');
+  assert.ok(realParticipant);
+  assert.equal(h.api.evaluate(realParticipant).ok, false);
+  assert.equal(h.api.evaluate({nameN: '合并的音频'}).ok, false, '没有全局白名单例外');
+});
+
+test('一个无 ID 的普通访客仍可判为违规，不依赖账号身份', () => {
+  const h = harness();
+  h.api.applyConfig({ requiredKeywords: 'AA' });
+  const visitor = h.api.readRow(element('John Smith', [], {'aria-label': 'John Smith'}), '');
+  assert.ok(visitor);
+  assert.equal(h.api.evaluate(visitor).ok, false);
+});
+
+test('明确面板为空时保留旧布局全局语义名单兜底，避免丢失真实人员', () => {
+  const h = harness();
+  const root = element();
+  const row = element('AA张三', [], {'aria-label':'AA张三'});
+  root.querySelectorAll = () => [];
+  h.document.querySelectorAll = (selector) => {
+    if (selector === '[data-panel-id="1"]') return [root];
+    if (selector === '[role="list"] [role="listitem"]') return [row];
+    return [];
+  };
+  assert.equal(h.api.findRowsRaw().length, 1);
+});
+
+test('前台已确认违规者不在名单视口时只允许最小目标定位，保留移出能力', async () => {
+  for (const [targetTop, shouldScroll] of [[130, true], [30, false]]) {
+    const h = harness();
+    h.document.hidden = false;
+    h.api.applyConfig({requiredKeywords:'AA'});
+    const f = kickFixture(h);
+    const sc = element();
+    sc.scrollHeight = 1300;
+    sc.clientHeight = 100;
+    sc.getBoundingClientRect = () => ({top: 0, bottom: 100});
+    f.target.row.parentElement = sc;
+    f.target.row.getBoundingClientRect = () => ({top: targetTop, bottom: targetTop + 20});
+    let focusScrolls = 0;
+    f.target.row.scrollIntoView = () => { focusScrolls++; };
+    h.context.getComputedStyle = (el) => ({visibility:'visible', overflowY: el === sc ? 'auto' : 'visible'});
+    await h.api.kick(f.target);
+    assert.equal(f.clicks(), 1, '经过原安全复核后仍须完成目标移出');
+    assert.equal(focusScrolls, shouldScroll ? 1 : 0,
+      '只有已确认的目标在可见区外，才允许最小范围的定位');
+  }
 });

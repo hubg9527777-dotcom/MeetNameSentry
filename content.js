@@ -1,5 +1,5 @@
 /**
- * MeetNameSentry — content.js (v1.0.3)
+ * MeetNameSentry — content.js (v1.0.4)
  * Google Meet 命名纪律守卫（只有主持人 / 联席主持人才真正有“移出”权限）
  *
  * 设计原则
@@ -124,6 +124,13 @@
   const PRESENTATION_RE =
     /\([^()]*(presentation|presenting|presentación|presentacion|apresenta|präsentation|présentation|presentazione|презентац|展示内容|展示內容|演示内容|プレゼン|발표|프레젠)[^()]*\)/;
   // 主持人徽标：只在“昵称之外”的次级文本里匹配，避免被昵称伪造
+  // Meet 自适应音频可能在人员列表中生成状态/分组文本；只有不带独立参会者 ID 且
+  // 文字恰好是系统状态名称的行才标记为歧义。不要把关键词匹配当成全局白名单，
+  // 否则真实参会者取相似名称会绕过规则。
+  const AUDIO_GROUP_STATUS_NAMES = new Set([
+    '合并的音频', '已合并音频', '音频已合并', '合併的音訊', '音訊已合併',
+    'merged audio', 'audio merged',
+  ]);
   const HOST_RE =
     /\b(?:co[-\s]?)?host\b|\borgani[sz]er\b|\bmoderator\b|主持|主办|主辦|ホスト|호스트|gastgeber|anfitri|hôte|organisateur|organizzatore|organizador|организатор|ведущий|ev sahibi|gospodarz|tuan rumah|chủ trì|người tổ chức/;
 
@@ -249,7 +256,10 @@
     clearTimeout(state.suspectReviewTimer); state.suspectReviewTimer = 0;
     state.coverage = null; state.lastSweepAt = 0; state.lastSweepCount = null;
     state.coverageMismatchSince = 0; state.coverageStatus = 'unknown';
-    state.noRemoveStreak = 0; state.pausedUntil = 0;
+    // 用户重新保存规则或关闭/开启巡检时，旧 60 秒失败窗口不能在新周期里再次触发熔断。
+    // 不重置 busy 或实际 DOM 操作：在途的移出仍由 configRevision 撤销授权。
+    state.recentFails = []; state.noRemoveStreak = 0;
+    state.pausedUntil = 0; state.pauseReason = '';
     state.lastOpenAttempt = 0; state.openAttempts = []; state.panelRetryAt = 0;
     configRevision++;
     configReady = true;
@@ -501,6 +511,8 @@
   function findRowsRaw() {
     const roots = [...document.querySelectorAll('[data-panel-id="1"]')].filter((el) => !isButtonLike(el));
     let rows = roots.flatMap((r) => [...r.querySelectorAll('[role="listitem"]')]).filter(isVisible);
+    // 兼容部分 Meet 新旧布局：人员面板暂时没有可读行时仍可探查全局语义列表。
+    // 不能仅凭空面板就停止排查，避免丢失已运行正常的旧布局移出能力。
     if (!rows.length) {
       rows = [...document.querySelectorAll('[role="list"] [role="listitem"]')].filter(
         (el) => !el.closest('[data-panel-id="2"], [role="dialog"], [role="alertdialog"], [role="menu"]')
@@ -516,6 +528,15 @@
       if ((oy === 'auto' || oy === 'scroll' || oy === 'overlay') && p.scrollHeight > p.clientHeight + 1) return p;
     }
     return null;
+  }
+
+  function targetOutsideRosterViewport(row) {
+    // 没有可信几何信息时不根据猜测滚动；后续菜单、按钮和目标仍要严格复核。
+    const sc = scrollParentOf(row);
+    const target = row?.getBoundingClientRect?.();
+    const viewport = sc?.getBoundingClientRect?.();
+    if (!target || !viewport) return false;
+    return target.top < viewport.top - 1 || target.bottom > viewport.bottom + 1;
   }
 
   const insideWithin = (el, root, sel) => {
@@ -616,6 +637,10 @@
       row.getAttribute('data-participant-id') ||
       row.querySelector('[data-participant-id]')?.getAttribute('data-participant-id') ||
       '';
+    // Meet 自适应音频在参与者侧栏可能出现系统分组/状态文本。历史现场曾把
+    // “合并的音频”误当作待移出对象；没有独立人员 ID 的同名行不授权破坏性操作。
+    // 有明确人员 ID 的同名真实参会者仍按原来的姓名规则审核，不创建绕过白名单。
+    if (!id && AUDIO_GROUP_STATUS_NAMES.has(nameN)) return null;
     // 自己：有可靠 id 就只认 id（文本标记可被昵称伪造）；否则退化为文本标记
     // 禁止用“昵称写 (You)”伪装自己；仅在 Meet 提供的参与者 ID 明确一致时豁免。
     const isSelf = Boolean(selfId && id && id === selfId);
@@ -653,11 +678,31 @@
    * 但移出/举报、警告确认及正在编辑的窗口仍必须保持隔离。
    * 该判断仅决定能否继续操作，绝不点击或关闭现有弹窗。
    */
+  // 仅用于阻止自动操作的弹窗：比普通名单行的几何可见性判断更严格。
+  // Meet 会保留已关闭的菜单/对话框 DOM，不能让 aria-hidden、inert、透明或屏幕外的
+  // 旧节点永久阻止打开人员面板；真正仍显示的危险弹窗继续完整阻止自动操作。
+  function isActiveOverlay(el) {
+    if (!isVisible(el) || el.hidden === true) return false;
+    // 逐层检查祖先，避免父容器已隐藏而子节点本身仍返回非空布局矩形。
+    for (let n = el; n && n !== document; n = n.parentElement) {
+      if (n.hidden === true || n.matches?.('[aria-hidden="true"], [inert]')) return false;
+      const style = getComputedStyle(n);
+      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+    }
+    const rect = el.getBoundingClientRect?.();
+    if (rect && Number.isFinite(rect.left) && Number.isFinite(rect.right) &&
+        Number.isFinite(rect.top) && Number.isFinite(rect.bottom) &&
+        Number.isFinite(window.innerWidth) && Number.isFinite(window.innerHeight) &&
+        window.innerWidth > 0 && window.innerHeight > 0 &&
+        (rect.right <= 0 || rect.bottom <= 0 || rect.left >= window.innerWidth || rect.top >= window.innerHeight)) return false;
+    return true;
+  }
+
   function blocksParticipantAutomation(overlay) {
-    if (!isVisible(overlay)) return false;
+    if (!isActiveOverlay(overlay)) return false;
     if (overlay.matches('[role="alertdialog"]')) return true;
     const editable = [...overlay.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="textbox"]')]
-      .some((el) => isVisible(el) && !el.readOnly && el.getAttribute('readonly') === null);
+      .some((el) => isActiveOverlay(el) && !el.readOnly && el.getAttribute('readonly') === null);
     if (editable) return true;
     const description = norm([
       overlay.getAttribute('aria-label'), overlay.getAttribute('title'), overlay.textContent,
@@ -1059,19 +1104,29 @@
       { itemCount: menu.querySelectorAll('[role^="menuitem"], li, button').length });
   }
 
+  // Meet 有些布局将可操作按钮名称放在 aria-label/title，按钮本身没有文字。
+  // 单独读取每个来源，任何来源含“举报/屏蔽/批量移出/取消”均否决；
+  // 不能把一个来源写着“移出”、另一个写着“举报”的按钮误判成安全确认。
+  const buttonNames = (button) => [
+    button.textContent, button.getAttribute?.('aria-label'), button.getAttribute?.('title'),
+  ].map(norm).filter(Boolean);
   const visibleButtons = (dialog) =>
-    [...dialog.querySelectorAll('button, [role="button"]')].filter((b) => isVisible(b) && norm(b.textContent));
-  const cancelButtons = (dialog) => visibleButtons(dialog).filter((b) => CANCEL_RE.test(norm(b.textContent)));
+    [...dialog.querySelectorAll('button, [role="button"]')]
+      .filter((b) => isVisible(b) && buttonNames(b).length);
+  const cancelButtons = (dialog) => visibleButtons(dialog)
+    .filter((b) => buttonNames(b).some((s) => CANCEL_RE.test(s)));
 
   function findConfirmButton(dialog) {
-    if (visibleButtons(dialog).some((b) => isBulkRemoval(norm(b.textContent)))) return null;
-    const hits = visibleButtons(dialog).filter((b) =>
-      !b.matches(':disabled, [aria-disabled="true"]') &&
-      !CANCEL_RE.test(norm(b.textContent)) &&
-      !MENU_NEGATIVE_RE.test(norm(b.textContent)) &&
-      !isBulkRemoval(norm(b.textContent)) &&
-      DESTRUCTIVE_RE.test(norm(b.textContent)));
-    // 不再猜测“非取消按钮”；举报/屏蔽或多个破坏性按钮均中止。
+    const buttons = visibleButtons(dialog);
+    if (buttons.some((b) => buttonNames(b).some(isBulkRemoval))) return null;
+    const hits = buttons.filter((b) => {
+      if (b.matches(':disabled, [aria-disabled="true"]')) return false;
+      const names = buttonNames(b);
+      return names.length > 0 &&
+        names.every((s) => !CANCEL_RE.test(s) && !MENU_NEGATIVE_RE.test(s) && !isBulkRemoval(s)) &&
+        names.some((s) => DESTRUCTIVE_RE.test(s));
+    });
+    // 只认唯一、明确声明“移出”的按钮，不猜测“确定”“继续”等通用确认。
     return hits.length === 1 ? hits[0] : null;
   }
 
@@ -1132,7 +1187,12 @@
       // ① 用 key 重新定位并复核（不信任采集时留下的节点引用）
       const first = locateTarget(target);
       if (!isOperableMoreButton(first.moreBtn, first.row)) throw new KickError('stale');
-      first.row.scrollIntoView?.({ block: 'nearest', behavior: 'instant' });
+      // 前台禁止为全量扫描而来回滚动，但不能损害已确认目标的移出能力。
+      // 只有目标实际位于最近滚动容器的可见区域之外，才做一次最小定位；
+      // 目标已经在视口内时绝不触动滚动位置，减少界面抖动。
+      if (document.hidden || targetOutsideRosterViewport(first.row)) {
+        first.row.scrollIntoView?.({ block: 'nearest', behavior: 'instant' });
+      }
 
       // ② 开菜单
       state.lastKickStage = 'open-menu';
@@ -1224,13 +1284,16 @@
     else if (state.recentFails.length >= 5) pause(2 * 60_000, '连续失败，疑似界面改版');
   }
 
-  /* ════════════════════════ 10. 大型会议：滚动扫描（仅在必要且用户空闲时） ════════════════════════ */
+  /* ════════════════════════ 10. 隐藏页面静默扫描（前台禁止周期性滚动整张名单） ════════════════════════ */
   async function maybeSweep() {
+    // 真实可见的会议只读取已渲染人员行；绝不为了全量覆盖而滚动整张名单。
+    // 虚拟列表中的未渲染人员只能在标签页隐藏后再通过受限滚动扫描补查。
+    if (!document.hidden) return;
     if (state.busy || state.sweeping || state.refreshingRoster) return;
     const list = state.observedList;
     if (!list || !list.isConnected) return;
     const sc = scrollParentOf(list);
-    if (!sc) { state.coverage = null; return; } // 全部可见：无需滚动，对用户零打扰
+    if (!sc) { state.coverage = null; return; } // 无滚动条：由当前真实 DOM 行判断
 
     const now = Date.now();
     const count = participantCount();
@@ -1238,42 +1301,52 @@
     const countChanged = count !== null && count !== state.lastSweepCount && since >= T.sweepMin;
     const due = since >= T.sweepInterval;
     const retry = state.incomplete && state.retries < 3 && since >= T.sweepRetry;
-    // 扫描中新发现的嫌疑人还差“第二次目击”：发现后 30s 内提前补扫确认，而不是干等 60s
     const confirm = since >= T.sweepRetry &&
       [...state.suspects].some(([k, s]) => !held(k, now) && now - s.first < 30_000);
     if (!(countChanged || due || retry || confirm)) return;
-    if (now - state.lastInput < T.idleBeforeSweep) return; // 用户在操作：让路
+    if (now - state.lastInput < T.idleBeforeSweep) return; // 用户刚操作过，仍然让路
     await sweep(sc, count);
   }
 
   async function sweep(sc, count) {
+    if (!document.hidden || !sc?.isConnected) return;
     state.sweeping = true;
     const origin = sc.scrollTop;
     const startedAt = Date.now();
     const sweepRevision = configRevision;
     const seen = new Set();
     let completed = false;
+    // 只恢复本次扫描自己移动过的位置，避免覆盖用户在切回页面时的手动滚动。
+    let lastOwnedTop = null;
+    const canContinue = () => alive() && document.hidden && sc.isConnected &&
+      configReady && cfg.enabled && Date.now() >= state.pausedUntil &&
+      sweepRevision === configRevision && state.lastInput <= startedAt;
+    const moveHidden = (top) => {
+      if (!canContinue()) return false;
+      sc.scrollTo({ top, behavior: 'instant' });
+      lastOwnedTop = sc.scrollTop;
+      return true;
+    };
     try {
-      sc.scrollTo({ top: 0, behavior: 'instant' });
-      for (let i = 0; i < 300 && alive() && sc.isConnected; i++) {
-        // 在后台浏览器可能延迟虚拟列表渲染；限制一次扫描的墙上耗时以免长期占用调度器。
+      if (!moveHidden(0)) return;
+      for (let i = 0; i < 300 && canContinue(); i++) {
+        // 隐藏页面可能延迟虚拟列表渲染；限制单次扫描时长和遍历次数。
         if (Date.now() - startedAt > 20_000) break;
-        if (!configReady || !cfg.enabled || Date.now() < state.pausedUntil ||
-            sweepRevision !== configRevision || state.lastInput > startedAt) break;
-        await waitForQuiet(state.observedList);       // 等虚拟列表渲染稳定，而不是睡固定时间
-        // 等待期间用户可能开始操作或熔断被触发，必须先检查再处置。
-        if (!configReady || !cfg.enabled || Date.now() < state.pausedUntil ||
-            sweepRevision !== configRevision || state.lastInput > startedAt) break;
+        await waitForQuiet(state.observedList);
+        // 等待时用户可能返回页面，立刻终止；不能趁前台可见继续滚动/操作。
+        if (!canContinue()) break;
         const target = harvest(seen);
-        if (target) await kick(target);                // 目标此刻就在视口内，直接处置
-        if (!configReady || !cfg.enabled || Date.now() < state.pausedUntil ||
-            sweepRevision !== configRevision || state.lastInput > startedAt) break;
+        if (target) await kick(target);
+        if (!canContinue()) break;
         if (sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2) { completed = true; break; }
-        // 步长 ≤ 70% 视口：相邻两屏必有重叠，不会漏掉被 overscan 之外的行
-        sc.scrollTo({ top: sc.scrollTop + Math.max(60, Math.floor(sc.clientHeight * 0.7)), behavior: 'instant' });
+        if (!moveHidden(sc.scrollTop + Math.max(60, Math.floor(sc.clientHeight * 0.7)))) break;
       }
     } finally {
-      if (sc.isConnected) sc.scrollTo({ top: origin, behavior: 'instant' }); // 还原用户的滚动位置
+      // 用户切回前台时最多恢复扫描前的位置一次；若用户已经手动移动列表，则不抢回。
+      if (sc.isConnected && lastOwnedTop !== null && state.lastInput <= startedAt &&
+          Math.abs(sc.scrollTop - lastOwnedTop) <= 2) {
+        sc.scrollTo({ top: origin, behavior: 'instant' });
+      }
       state.sweeping = false;
       state.lastSweepAt = Date.now();
       state.retries = count !== state.lastSweepCount ? 0 : state.retries + 1;
@@ -1412,7 +1485,7 @@
     } catch { /* 诊断失败不影响生命体征回复，也不授权移出 */ }
     return {
       protocol: HEALTH_PROTOCOL,
-      version: '1.0.3',
+      version: '1.0.4',
       alive: alive(),
       configReady,
       enabled: configReady && cfg.enabled,
@@ -1513,7 +1586,7 @@
     state.rootObserver.observe(document.documentElement, { childList: true, subtree: true });
 
     wake();
-    console.info(LOG, '巡检引擎已挂载 v1.0.3');
+    console.info(LOG, '巡检引擎已挂载 v1.0.4');
   })().catch((err) => {
     console.error(LOG, '巡检引擎初始化异常：', safeErrorKind(err));
     try { hud.set('启动异常 · 正在等待监护恢复', C.err); } catch { /* DOM 暂不可用 */ }

@@ -248,7 +248,7 @@ test('首次安装默认开启并自动注册 MAIN world，不增加权限',asyn
   // 未写入过开关，也应按首次安装默认开启；注册不会被误认为用户明确选择。
   assert.equal(h.state.mnsRafExperimentEnabled,undefined);
   const manifest=JSON.parse(fs.readFileSync(path.join(__dirname,'manifest.json')));
-  assert.equal(manifest.version,'1.0.3');
+  assert.equal(manifest.version,'1.0.4');
   assert.deepEqual(manifest.permissions,['storage','scripting','alarms']);
 });
 
@@ -342,6 +342,32 @@ test('只接受扩展本身的 popup.html 管理消息，拒绝其他发送者�
   assert.equal(response.registered,true);
 });
 
+
+test('即使冒充同扩展 popup.html，来自标签页的管理消息也必须拒绝', async () => {
+  const h=backgroundHarness();
+  await h.api.rafExperimentStatus();
+  const reply=h.listeners.message(
+    {protocol:'MNS_RAF_EXP_V102',action:'DISABLE'},
+    {id:'mns-test',url:'chrome-extension://mns-test/popup.html',tab:{id:8}},
+    ()=>{throw new Error('unexpected callback');}
+  );
+  assert.equal(reply,false);
+  assert.equal(h.state.mnsRafExperimentEnabled,undefined);
+  assert.equal(h.registered.size,1);
+});
+
+test('后台管理失败回复不能回显可能包含会议信息的异常文本', async () => {
+  const h=backgroundHarness({failStorage:true});
+  await h.api.rafExperimentStatus();
+  const result=await new Promise(resolve=>{
+    assert.equal(h.listeners.message(
+      {protocol:'MNS_RAF_EXP_V102',action:'DISABLE'},
+      {id:'mns-test',url:'chrome-extension://mns-test/popup.html'},resolve),true);
+  });
+  assert.equal(result.ok,false);
+  assert.equal(result.error,'unexpected-error');
+  assert.equal(h.registered.size,1);
+});
 
 test('检测状态区分脚本已注册与当前页面真正桥接已运行',async()=>{
   const h=backgroundHarness();

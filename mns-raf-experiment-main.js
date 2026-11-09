@@ -1,5 +1,5 @@
 /*
- * MeetNameSentry v1.0.3 — 后台名单辅助的 rAF 调度桥。
+ * MeetNameSentry v1.0.4 — 后台名单辅助的 rAF 调度桥。
  * MAIN world, document_start; 不伪造可见性、不修改名单、不点击、不读取姓名。
  * 目的：在 Meet 隐藏时为页面待处理 rAF 回调提供低频后备调度，帮助名单更新。
  * 注意：定时器不能强迫 Chrome 的合成器生成真实帧，不能保证后台可用。
